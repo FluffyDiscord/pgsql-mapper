@@ -1,0 +1,9 @@
+-include pgsql_mapper.dep
+pgsql_mapper.lo: /home/k/PhpstormProjects/pgsql-mapper/pgsql_mapper.c
+	$(LIBTOOL) --tag=CC --mode=compile $(CC) -I. -I/home/k/PhpstormProjects/pgsql-mapper $(COMMON_FLAGS) $(CFLAGS_CLEAN) $(EXTRA_CFLAGS)   -DZEND_COMPILE_DL_EXT=1 -c /home/k/PhpstormProjects/pgsql-mapper/pgsql_mapper.c -o pgsql_mapper.lo  -MMD -MF pgsql_mapper.dep -MT pgsql_mapper.lo
+$(phplibdir)/pgsql_mapper.la: ./pgsql_mapper.la
+	$(LIBTOOL) --tag=CC --mode=install cp ./pgsql_mapper.la $(phplibdir)
+
+./pgsql_mapper.la: $(shared_objects_pgsql_mapper) $(PGSQL_MAPPER_SHARED_DEPENDENCIES)
+	$(LIBTOOL) --tag=CC --mode=link $(CC) -shared $(COMMON_FLAGS) $(CFLAGS_CLEAN) $(EXTRA_CFLAGS) $(LDFLAGS)  -o $@ -export-dynamic -avoid-version -prefer-pic -module -rpath $(phplibdir) $(EXTRA_LDFLAGS) $(shared_objects_pgsql_mapper) $(PGSQL_MAPPER_SHARED_LIBADD)
+

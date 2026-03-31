@@ -5,10 +5,10 @@
     "keywords": ["postgresql", "pgsql", "extension", "mapper", "performance", "dto"],
     "license": "MIT",
     "require": {
-        "php": ">=8.1"
+        "php": ">=8.5"
     },
     "support": {
-        "source": "https://github.com/fluffydiscord/pgsql-mapper",
-        "issues": "https://github.com/fluffydiscord/pgsql-mapper/issues"
+        "source": "https://github.com/FluffyDiscord/pgsql-mapper",
+        "issues": "https://github.com/FluffyDiscord/pgsql-mapper/issues"
     }
 }

@@ -137,7 +137,7 @@ no additional processing cost, and with lower peak memory usage.
 Baseline: raw-pg | wrk: -t4 -c12 -d20s --latency
 
 - **raw-pg** - pg_query_params() + pg_fetch_all(); rows returned as raw associative arrays — no mapping.
-- **raw-dto** - pg_query_params() + pg_fetch_assoc() in a while loop; each row immediately mapped into an object with constructor in php.
+- **raw-dto** - pg_query_params() + pg_fetch_assoc() in a while loop; each row immediately mapped into an object with constructor in php. Note: there was no measurable difference between pg_fetch_all and foreach vs pg_fetch_assoc in while loop
 - **pg-fast** - pg_query() + pg_fast_query() userland helper; deserializes rows directly into an object via this extension.
 - **pg-fast-inh** - Same as pg-fast but targets object extending another object (child class), both with constructors; tests overhead of inheritance in the deserialization path.
 - **cycle** - Cycle ORM Select + fetchAll(); returns fully hydrated CycleAccount entities with identity map.

@@ -1,5 +1,11 @@
 # pgsql fast "raw row -> php object" mapper
 
+> [!WARNING]
+> **This extension was written by AI (Claude) and is NOT production-ready.**
+> Use at your own risk. The author takes no liability for any damages, data loss,
+> crashes, or other issues arising from its use. No guarantees are made regarding
+> correctness, stability, or security.
+
 Claude created php extension to map postgresql rows to php objects right in
 the C language, with caveats of course, to make it faster.
 

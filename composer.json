@@ -1,6 +1,6 @@
 {
     "name": "fluffydiscord/pgsql-mapper",
-    "description": "PHP C extension: maps PostgreSQL query results to typed PHP objects, 3x faster than PDO::FETCH_CLASS",
+    "description": "PHP C extension: maps PostgreSQL query results to typed PHP objects",
     "type": "php-ext",
     "keywords": ["postgresql", "pgsql", "extension", "mapper", "performance", "dto"],
     "license": "MIT",

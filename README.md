@@ -9,7 +9,7 @@
 Claude created php extension to map postgresql rows to php objects right in
 the C language, with caveats of course, to make it faster.
 
-This makes it **~1.4–1.6x faster** than doing it manually in PHP, or using something like `PDO::FETCH_CLASS`,
+This makes it **~1.5–2.0x faster** than doing it manually in PHP, or using something like `PDO::FETCH_CLASS`,
 which maps only strings, and is also slow, so it's terrible.
 
 ### Acknowledgment
@@ -150,19 +150,20 @@ readonly class Row {
 
 ### Last results
 
-Measured with a fair benchmark: PHP baselines include `pg_fetch_assoc` per row inside the
-timing loop, matching the data-access cost the C extension pays reading from `PGresult`.
+Measured with a fair benchmark (`test_performance.php`, 5000 rows, best of 10 runs, PHP 8.5):
+PHP baselines include `pg_fetch_assoc` per row inside the timing loop, matching the data-access
+cost the C extension pays reading from `PGresult`.
 
 | Path                                         | C (ns/row) | PHP (ns/row) | Speedup |
 |----------------------------------------------|----------:|-------------:|--------:|
-| Raw `pg_fetch_assoc` loop (no objects)       |         — |          132 |       — |
-| FlatDto — no constructor (fast path)         |       324 |          526 |  **1.63x** |
-| AccountDto — promoted-only ctor (fast path)  |       504 |          732 |  **1.45x** |
-| AccountDtoTwo — complex ctor + nested object |      1013 |         1386 |  **1.37x** |
+| Raw `pg_fetch_assoc` loop (no objects)       |         — |          122 |       — |
+| FlatDto — no constructor (fast path)         |       253 |          520 |  **2.05x** |
+| AccountDto — promoted-only ctor (fast path)  |       360 |          571 |  **1.59x** |
+| AccountDtoTwo — complex ctor + nested object |       655 |          985 |  **1.50x** |
 
 The fast path (no constructor, no inheritance) gives the best speedup because the C extension
 writes directly to property slots without going through the PHP VM. Once a constructor is
-involved, the VM must execute per row and the advantage shrinks to ~1.4x.
+involved, the VM must execute per row and the advantage shrinks to ~1.5x.
 
 **On a real project**, test results are promising. With this extension, mapping to an arbitrary object
 with no constructor (the most optimal way) results in basically the same speed as returning plain array,

@@ -15,6 +15,7 @@
 #include "ext/standard/info.h"
 #include "ext/date/php_date.h"
 #include "zend_exceptions.h"
+#include "zend_enum.h"
 
 #include "php_pgsql_mapper.h"
 
@@ -36,6 +37,7 @@ typedef struct {
     zend_property_info *props[MAX_NESTING_DEPTH];
     uint32_t offsets[MAX_NESTING_DEPTH];
     zend_class_entry *datetime_ce;
+    zend_class_entry *enum_ce;
     bool skip_type_check;
     bool accepts_null;
     bool valid;
@@ -94,6 +96,36 @@ static zend_class_entry *resolve_datetime_ce(zend_property_info *prop,
     if (type_ce->create_object != default_immutable_ce->create_object) return default_immutable_ce;
 
     return type_ce;
+}
+
+/* Pick the backed-enum class for a column whose fast-path property is typed as
+ * one, when the enum's backing kind matches the column: int-backed ← integer
+ * columns, string-backed ← text-ish columns (anything not natively parsed as
+ * int/float/bool/timestamp). Returns NULL when it does not apply (kept raw). */
+static zend_class_entry *resolve_enum_ce(zend_property_info *prop, Oid oid)
+{
+    if (!prop || !ZEND_TYPE_IS_SET(prop->type)) return NULL;
+    if (!ZEND_TYPE_HAS_NAME(prop->type)) return NULL;
+
+    zend_class_entry *type_ce = zend_lookup_class(ZEND_TYPE_NAME(prop->type));
+    if (!type_ce) return NULL;
+    if (!(type_ce->ce_flags & ZEND_ACC_ENUM)) return NULL;
+
+    uint32_t backing = type_ce->enum_backing_type;
+
+    if (backing == IS_LONG) {
+        bool int_col = (oid == PG_OID_INT2 || oid == PG_OID_INT4 || oid == PG_OID_INT8);
+        return int_col ? type_ce : NULL;
+    }
+
+    if (backing == IS_STRING) {
+        bool scalar_col = (oid == PG_OID_INT2 || oid == PG_OID_INT4 || oid == PG_OID_INT8
+            || oid == PG_OID_FLOAT4 || oid == PG_OID_FLOAT8 || oid == PG_OID_BOOL
+            || oid == PG_OID_TIMESTAMP || oid == PG_OID_TIMESTAMPTZ);
+        return scalar_col ? NULL : type_ce;
+    }
+
+    return NULL;
 }
 
 /* Get the first declared public non-static property of a class. */
@@ -243,6 +275,32 @@ static void convert_pg_datetime(zval *val, const char *raw, int len,
     }
 }
 
+/* Resolve a backed-enum case from a non-NULL PG value — from() semantics
+ * (throws ValueError on an unknown value). Returns false with an exception
+ * pending on failure; otherwise stores the (incref'd) case singleton. */
+static bool convert_pg_enum(zval *val, const char *raw, int len,
+                            zend_class_entry *enum_ce)
+{
+    zend_object *case_obj = NULL;
+    zend_result status;
+
+    if (enum_ce->enum_backing_type == IS_LONG) {
+        status = zend_enum_get_case_by_value(&case_obj, enum_ce, fast_parse_long(raw), NULL, false);
+    } else {
+        zend_string *key = zend_string_init(raw, len, 0);
+        status = zend_enum_get_case_by_value(&case_obj, enum_ce, 0, key, false);
+        zend_string_release(key);
+    }
+
+    if (status == FAILURE) {
+        ZVAL_UNDEF(val);
+        return false;
+    }
+
+    ZVAL_OBJ_COPY(val, case_obj);
+    return true;
+}
+
 /* Convert a non-NULL PG value to a zval based on column OID.
  * Fast cases are force-inlined; datetime stays out-of-line. */
 static zend_always_inline void convert_pg_value(zval *val, const char *raw, int len,
@@ -330,11 +388,13 @@ static void build_col_mapping(col_mapping *m, const char *col_name, size_t col_l
     m->depth = nseg;
 
     /* Auto-nest: flat column (no dot) where property is a non-DateTime class.
-     * Expand to depth 2: value goes to the first property of the nested class. */
+     * Expand to depth 2: value goes to the first property of the nested class.
+     * Enums are excluded — they cannot be instantiated and are mapped by value. */
     if (nseg == 1) {
         zend_class_entry *prop_ce = resolve_property_class(m->props[0]);
         if (prop_ce
             && !instanceof_function(prop_ce, php_date_get_interface_ce())
+            && !(prop_ce->ce_flags & ZEND_ACC_ENUM)
             && is_fast_path_class(prop_ce)) {
             zend_string *first_name = NULL;
             zend_property_info *first_prop = NULL;
@@ -358,6 +418,12 @@ static void build_col_mapping(col_mapping *m, const char *col_name, size_t col_l
     m->skip_type_check = can_skip_type_check(m->props[leaf], oid, m->datetime_ce);
     m->accepts_null = !ZEND_TYPE_IS_SET(m->props[leaf]->type) ||
                       (ZEND_TYPE_FULL_MASK(m->props[leaf]->type) & MAY_BE_NULL);
+
+    m->enum_ce = resolve_enum_ce(m->props[leaf], oid);
+    if (m->enum_ce) {
+        m->skip_type_check = true;
+    }
+
     m->valid = true;
 }
 
@@ -472,10 +538,14 @@ PHP_FUNCTION(pg_fast_query)
      * Fast-path columns carry the type-directed class (Carbon\CarbonImmutable etc.);
      * everything else falls back to DateTimeImmutable. */
     zend_class_entry **col_datetime_ces = safe_emalloc(ncols, sizeof(zend_class_entry *), 0);
+    zend_class_entry **col_enum_ces = safe_emalloc(ncols, sizeof(zend_class_entry *), 0);
     for (int c = 0; c < ncols; c++) {
         col_datetime_ces[c] = (class_fast_path && mappings[c].valid && mappings[c].datetime_ce)
             ? mappings[c].datetime_ce
             : datetime_ce;
+        col_enum_ces[c] = (class_fast_path && mappings[c].valid)
+            ? mappings[c].enum_ce
+            : NULL;
     }
 
     /* ---- Constructor analysis ---- */
@@ -536,6 +606,7 @@ PHP_FUNCTION(pg_fast_query)
                 zend_class_entry *pce = zend_lookup_class(ZEND_TYPE_NAME(arg_info[p].type));
                 if (pce &&
                     !instanceof_function(pce, php_date_get_interface_ce()) &&
+                    !(pce->ce_flags & ZEND_ACC_ENUM) &&
                     is_fast_path_class(pce)) {
                     zend_string *fn;
                     zend_property_info *fp;
@@ -553,7 +624,7 @@ PHP_FUNCTION(pg_fast_query)
             if (!ZEND_TYPE_IS_SET(arg_info[p].type) || !ZEND_TYPE_HAS_NAME(arg_info[p].type)) continue;
 
             zend_class_entry *pce = zend_lookup_class(ZEND_TYPE_NAME(arg_info[p].type));
-            if (!pce || instanceof_function(pce, php_date_get_interface_ce()) || !is_fast_path_class(pce)) continue;
+            if (!pce || instanceof_function(pce, php_date_get_interface_ce()) || (pce->ce_flags & ZEND_ACC_ENUM) || !is_fast_path_class(pce)) continue;
 
             zend_string *pname = arg_info[p].name;
             size_t pname_len = ZSTR_LEN(pname);
@@ -836,6 +907,12 @@ PHP_FUNCTION(pg_fast_query)
 
             if (is_null) {
                 ZVAL_NULL(&val);
+            } else if (col_enum_ces[c] != NULL) {
+                if (!convert_pg_enum(&val, PQgetvalue(res, r, c),
+                                     PQgetlength(res, r, c), col_enum_ces[c])) {
+                    zval_ptr_dtor(&row_obj);
+                    goto cleanup;
+                }
             } else {
                 convert_pg_value(&val, PQgetvalue(res, r, c),
                                  PQgetlength(res, r, c), col_oids[c], col_datetime_ces[c]);
@@ -912,6 +989,7 @@ cleanup:
         efree(col_names);
     }
     efree(col_datetime_ces);
+    efree(col_enum_ces);
     efree(col_oids);
 
     if (ctor_ht_inited) zend_hash_destroy(&ctor_named_ht);

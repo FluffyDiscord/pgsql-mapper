@@ -124,6 +124,27 @@ subclasses that are safe to mint this way are supported:
 
 Constructor and `__set`/`create_object` (non-fast-path) classes always receive `\DateTimeImmutable`.
 
+### Backed enum columns (type-directed)
+
+On the fast path, if the destination property is typed as a **backed enum** whose backing kind
+matches the column, the value is mapped to the enum **case** (via the same lookup `Enum::from()`
+uses — the case singleton, no allocation) instead of a raw string/int:
+
+```php
+enum Status: string { case Active = 'active'; case Ended = 'ended'; }
+
+readonly class Row {
+    public int $id;
+    public Status $status;   // 'active' text column -> Status::Active
+    public ?Status $maybe;   // NULL column -> null
+}
+```
+
+- string-backed enum ← text column; int-backed enum ← integer column (mismatched backing/column is
+  left as the raw value).
+- Unknown value → `ValueError` (from() semantics), matching `Enum::from()`.
+- Pure (non-backed) enums are not mapped. Constructor / non-fast-path classes receive the raw value.
+
 ### Build
 - `bash build-install.sh`
 

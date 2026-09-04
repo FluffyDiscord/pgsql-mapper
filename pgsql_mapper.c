@@ -35,6 +35,7 @@ typedef struct {
     zend_class_entry *ces[MAX_NESTING_DEPTH];
     zend_property_info *props[MAX_NESTING_DEPTH];
     uint32_t offsets[MAX_NESTING_DEPTH];
+    zend_class_entry *datetime_ce;
     bool skip_type_check;
     bool accepts_null;
     bool valid;
@@ -66,6 +67,33 @@ static zend_class_entry *resolve_property_class(zend_property_info *prop)
     if (!prop || !ZEND_TYPE_IS_SET(prop->type)) return NULL;
     if (!ZEND_TYPE_HAS_NAME(prop->type)) return NULL;
     return zend_lookup_class(ZEND_TYPE_NAME(prop->type));
+}
+
+/* Pick the class to instantiate for a timestamp/timestamptz leaf property.
+ * A property typed as a concrete subclass of DateTimeImmutable (e.g.
+ * Carbon\CarbonImmutable) is instantiated as that exact class so the value
+ * lands directly in its typed slot; otherwise DateTimeImmutable is used.
+ * The date extension's create_object handler (inherited by the subclass)
+ * sizes the php_date_obj for the subclass — Carbon's PHP __construct is
+ * bypassed, matching how Carbon's own immutable operations mint instances. */
+static zend_class_entry *resolve_datetime_ce(zend_property_info *prop,
+                                             zend_class_entry *default_immutable_ce)
+{
+    if (!prop || !ZEND_TYPE_IS_SET(prop->type)) return default_immutable_ce;
+    if (!ZEND_TYPE_HAS_NAME(prop->type)) return default_immutable_ce;
+
+    zend_class_entry *type_ce = zend_lookup_class(ZEND_TYPE_NAME(prop->type));
+    if (!type_ce) return default_immutable_ce;
+    if (type_ce->ce_flags & (ZEND_ACC_ABSTRACT | ZEND_ACC_INTERFACE)) return default_immutable_ce;
+    if (!instanceof_function(type_ce, default_immutable_ce)) return default_immutable_ce;
+
+    /* The subclass must reuse the date extension's object handler so
+     * php_date_instantiate yields a correctly sized php_date_obj. A pure-PHP
+     * subclass (Carbon) inherits it; an internal class with its own layout
+     * would not — fall back rather than instantiate an incompatible object. */
+    if (type_ce->create_object != default_immutable_ce->create_object) return default_immutable_ce;
+
+    return type_ce;
 }
 
 /* Get the first declared public non-static property of a class. */
@@ -322,7 +350,12 @@ static void build_col_mapping(col_mapping *m, const char *col_name, size_t col_l
 
     /* Leaf type check info */
     int leaf = m->depth - 1;
-    m->skip_type_check = can_skip_type_check(m->props[leaf], oid, datetime_ce);
+    if (oid == PG_OID_TIMESTAMP || oid == PG_OID_TIMESTAMPTZ) {
+        m->datetime_ce = resolve_datetime_ce(m->props[leaf], datetime_ce);
+    } else {
+        m->datetime_ce = datetime_ce;
+    }
+    m->skip_type_check = can_skip_type_check(m->props[leaf], oid, m->datetime_ce);
     m->accepts_null = !ZEND_TYPE_IS_SET(m->props[leaf]->type) ||
                       (ZEND_TYPE_FULL_MASK(m->props[leaf]->type) & MAY_BE_NULL);
     m->valid = true;
@@ -433,6 +466,16 @@ PHP_FUNCTION(pg_fast_query)
                 zend_string_init(fname, strlen(fname), 0)
             );
         }
+    }
+
+    /* Per-column datetime instantiation class, hoisted out of the row loop.
+     * Fast-path columns carry the type-directed class (Carbon\CarbonImmutable etc.);
+     * everything else falls back to DateTimeImmutable. */
+    zend_class_entry **col_datetime_ces = safe_emalloc(ncols, sizeof(zend_class_entry *), 0);
+    for (int c = 0; c < ncols; c++) {
+        col_datetime_ces[c] = (class_fast_path && mappings[c].valid && mappings[c].datetime_ce)
+            ? mappings[c].datetime_ce
+            : datetime_ce;
     }
 
     /* ---- Constructor analysis ---- */
@@ -795,7 +838,7 @@ PHP_FUNCTION(pg_fast_query)
                 ZVAL_NULL(&val);
             } else {
                 convert_pg_value(&val, PQgetvalue(res, r, c),
-                                 PQgetlength(res, r, c), col_oids[c], datetime_ce);
+                                 PQgetlength(res, r, c), col_oids[c], col_datetime_ces[c]);
             }
 
             /* ---- Fast path: direct property slot writes with nested support ---- */
@@ -868,6 +911,7 @@ cleanup:
         for (int c = 0; c < ncols; c++) zend_string_release(col_names[c]);
         efree(col_names);
     }
+    efree(col_datetime_ces);
     efree(col_oids);
 
     if (ctor_ht_inited) zend_hash_destroy(&ctor_named_ht);

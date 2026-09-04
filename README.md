@@ -101,6 +101,29 @@ readonly class Email {
 You don't need to use the dot path to set "nested.email" value, but you can just name is as "nested",
 the C extension auto picks first property in class and sets its value to that.
 
+### Datetime columns (type-directed)
+
+`timestamp` / `timestamptz` columns hydrate into `\DateTimeImmutable` by default. On the fast
+path (no constructor, direct property), if the destination property is typed as a **concrete
+subclass of `\DateTimeImmutable`**, the extension instantiates that exact class into the slot:
+
+```php
+readonly class Row {
+    public int $id;
+    public ?\Carbon\CarbonImmutable $created_at; // hydrated as CarbonImmutable, not DateTimeImmutable
+}
+```
+
+The instance is built through the date extension's object handler (the PHP `__construct` is
+bypassed — the same way `DateTimeImmutable`/Carbon mint instances from `modify()` etc.). Only
+subclasses that are safe to mint this way are supported:
+- **pure-PHP subclasses** (e.g. `Carbon\CarbonImmutable`) — supported;
+- a subclass that declares its own **required typed property with no default** would be left
+  uninitialized (accessing it throws) — don't use such a class here;
+- an internal class with a different object layout is ignored (falls back to `DateTimeImmutable`).
+
+Constructor and `__set`/`create_object` (non-fast-path) classes always receive `\DateTimeImmutable`.
+
 ### Build
 - `bash build-install.sh`
 

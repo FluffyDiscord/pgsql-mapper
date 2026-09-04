@@ -8,7 +8,7 @@
 #include "php.h"
 #include <libpq-fe.h>
 
-#define PHP_PGSQL_MAPPER_VERSION "0.1.0"
+#define PHP_PGSQL_MAPPER_VERSION "0.2.0"
 #define PHP_PGSQL_MAPPER_EXTNAME "pgsql_mapper"
 
 extern zend_module_entry pgsql_mapper_module_entry;

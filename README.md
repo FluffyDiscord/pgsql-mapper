@@ -131,7 +131,7 @@ readonly class Product
 }
 ```
 
-- `json`/`jsonb` → same as `json_decode($value, true, 512, JSON_THROW_ON_ERROR)`. Invalid JSON (e.g. non-UTF-8 `client_encoding`) or deeper than 512 levels → `JsonException`, even on a nullable property.
+- `json`/`jsonb` → same as `json_decode($value, true, 512, JSON_THROW_ON_ERROR)`. Invalid JSON (e.g. non-UTF-8 `client_encoding`) or 512+ levels deep → `JsonException`, even on a nullable property.
 - JSON scalar (`"text"`, `42`) → `TypeError`.
 - Elements convert like columns: `int4[]` → `int`, `float8[]` → `float`, `bool[]` → `bool`, `timestamptz[]` → `DateTimeImmutable`, anything else → `string`.
 - Multi-dimensional → nested lists. Custom bounds (`[0:2]={…}`) → 0-based list.

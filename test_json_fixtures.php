@@ -27,6 +27,21 @@ foreach (glob("$data_dir/num/*.txt") as $file) {
     }
 }
 
+function is_same_outcome(mixed $expected, mixed $actual): bool
+{
+    $both_threw = $expected instanceof JsonException && $actual instanceof JsonException;
+    if ($both_threw) {
+        return $expected->getCode() === $actual->getCode();
+    }
+
+    $either_threw = $expected instanceof Throwable || $actual instanceof Throwable;
+    if ($either_threw) {
+        return false;
+    }
+
+    return serialize($actual) === serialize($expected);
+}
+
 function describe(mixed $outcome): string
 {
     if ($outcome instanceof Throwable) {
@@ -62,10 +77,7 @@ try {
             $actual = $exception;
         }
 
-        $both_threw = $expected instanceof JsonException && $actual instanceof JsonException;
-        $same = $both_threw
-            ? $expected->getCode() === $actual->getCode()
-            : !$actual instanceof Throwable && !$expected instanceof Throwable && serialize($actual) === serialize($expected);
+        $same = is_same_outcome($expected, $actual);
 
         if ($same) {
             $passed++;

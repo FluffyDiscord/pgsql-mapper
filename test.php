@@ -602,7 +602,7 @@ function map_json_error(PgSql\Connection $conn, string $sql): ?JsonException
     return null;
 }
 
-$too_deep = map_json_error($conn, "SELECT (repeat('[', 600) || repeat(']', 600))::jsonb AS doc");
+$too_deep = map_json_error($conn, "SELECT (repeat('[', 512) || repeat(']', 512))::jsonb AS doc");
 assert($too_deep?->getCode() === JSON_ERROR_DEPTH);
 assert($too_deep->getMessage() === 'Maximum stack depth exceeded');
 

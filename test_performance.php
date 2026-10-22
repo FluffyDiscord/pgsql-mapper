@@ -51,6 +51,10 @@ readonly class AccountDtoTwo extends AccountDto
     }
 }
 
+class JsonDto { public array $doc; }
+class ListDto { public array $values; }
+class DateDto { public \DateTimeImmutable $day; }
+
 $conn = pg_connect("host=127.0.0.1 port=15432 dbname=postgres_air user=app password=app");
 if (!$conn) die("Connection failed\n");
 
@@ -237,6 +241,71 @@ for ($run = 0; $run < $iters; $run++) {
 $ns_php_adt2 = $best / $N;
 echo sprintf("PHP AccountDtoTwo (fetch_assoc+ctor): %8.1f ns/row   speedup: %.2fx\n",
     $ns_php_adt2, $ns_php_adt2 / $ns_c_adt2);
+
+echo "\n";
+
+// -------------------------------------------------------------------------
+// Type-directed columns — jsonb / PG arrays / date into typed properties
+// -------------------------------------------------------------------------
+
+$typed_cases = [
+    'jsonb ~80 B -> array' => [
+        "SELECT jsonb_build_object('id', g, 'name', 'user_' || g, 'active', g % 2 = 0, 'score', g * 1.5, 'tags', jsonb_build_array('a', 'b', 'c')) AS doc FROM generate_series(1, $N) g",
+        JsonDto::class,
+        fn (array $row) => json_decode($row['doc'], true),
+    ],
+    'jsonb ~1 KB -> array' => [
+        "SELECT jsonb_build_object('order', g, 'customer', jsonb_build_object('id', g, 'email', 'u' || g || '@example.com', 'address', jsonb_build_object('city', 'Prague', 'zip', '11000')), 'items', (SELECT jsonb_agg(jsonb_build_object('sku', 'SKU-' || g || '-' || j, 'qty', j, 'price', j * 9.99, 'meta', jsonb_build_object('color', 'red', 'size', 'XL', 'note', NULL))) FROM generate_series(0, 9) j)) AS doc FROM generate_series(1, $N) g",
+        JsonDto::class,
+        fn (array $row) => json_decode($row['doc'], true),
+    ],
+    'int4[] 10 items -> array' => [
+        "SELECT ARRAY(SELECT g * 10 + j FROM generate_series(1, 10) j) AS values FROM generate_series(1, $N) g",
+        ListDto::class,
+        fn (array $row) => array_map('intval', explode(',', trim($row['values'], '{}'))),
+    ],
+    'text[] 5 quoted -> array' => [
+        "SELECT ARRAY['alpha', 'beta gamma', 'delta \"q\"', 'epsilon', 'zeta,eta'] AS values FROM generate_series(1, $N) g",
+        ListDto::class,
+        fn (array $row) => str_getcsv(trim($row['values'], '{}'), ',', '"', '\\'),
+    ],
+    'date -> DateTimeImmutable' => [
+        "SELECT '2025-01-02'::date + g AS day FROM generate_series(1, $N) g",
+        DateDto::class,
+        fn (array $row) => new \DateTimeImmutable($row['day'] . ' 00:00:00+00:00'),
+    ],
+];
+
+foreach ($typed_cases as $label => [$sql, $class, $php_mapping]) {
+    $r_typed = pg_query($conn, $sql);
+    $rows = null;
+
+    pg_fast_query($r_typed, $class); // warmup
+    $best = PHP_INT_MAX;
+    for ($run = 0; $run < $iters; $run++) {
+        $rows = null;
+        $t0 = hrtime(true);
+        $rows = pg_fast_query($r_typed, $class);
+        $best = min($best, hrtime(true) - $t0);
+    }
+    $ns_c_typed = $best / $N;
+
+    $best = PHP_INT_MAX;
+    for ($run = 0; $run < $iters; $run++) {
+        pg_result_seek($r_typed, 0);
+        $rows = null;
+        $t0 = hrtime(true);
+        $rows = [];
+        while ($row = pg_fetch_assoc($r_typed)) {
+            $rows[] = $php_mapping($row);
+        }
+        $best = min($best, hrtime(true) - $t0);
+    }
+    $ns_php_typed = $best / $N;
+
+    echo sprintf("%-26s C %8.1f ns/row   PHP %8.1f ns/row   speedup: %.2fx\n",
+        $label, $ns_c_typed, $ns_php_typed, $ns_php_typed / $ns_c_typed);
+}
 
 echo "\n--- Summary ---\n";
 echo sprintf("Data fetch overhead (pg_fetch_assoc): %8.1f ns/row\n", $ns_fetch_assoc);

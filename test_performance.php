@@ -52,6 +52,8 @@ readonly class AccountDtoTwo extends AccountDto
 }
 
 class JsonDto { public array $doc; }
+class ChatMessageDto { public ?array $values; public array $blocks; public ?array $tool_rounds; }
+class ChatMessageRawDto { public ?string $values; public string $blocks; public ?string $tool_rounds; }
 class ListDto { public array $values; }
 class DateDto { public \DateTimeImmutable $day; }
 
@@ -248,6 +250,22 @@ echo "\n";
 // Type-directed columns — jsonb / PG arrays / date into typed properties
 // -------------------------------------------------------------------------
 
+$chat_message_sql = <<<SQL
+    SELECT jsonb_build_object('email', 'customer' || g || '@example.com', 'name', 'Customer ' || g, 'phone', '+1 555 0100', 'quantity', g % 5) AS values,
+           jsonb_build_array(
+               jsonb_build_object('type', 'text', 'text', 'Here are three products that match your request. All of them are in stock and ship within two days.'),
+               jsonb_build_object('type', 'products', 'items', (
+                   SELECT jsonb_agg(jsonb_build_object('code', 'SKU-' || (10000 + g + j), 'name', 'Product ' || j, 'price', (19.90 + j * 6) || ' USD',
+                                                       'url', 'https://shop.example.com/p/product-' || j, 'image', 'https://cdn.example.com/i/' || (10000 + g + j) || '.webp', 'inStock', j < 3))
+                   FROM generate_series(1, 3) j))
+           ) AS blocks,
+           jsonb_build_array(jsonb_build_object(
+               'calls', jsonb_build_array(jsonb_build_object('id', 'call_0_' || g, 'name', 'search_products', 'arguments', jsonb_build_object('query', 'hiking boots', 'limit', 5, 'maxPrice', 35))),
+               'results', jsonb_build_array(jsonb_build_object('id', 'call_0_' || g, 'text', 'SKU-10021 Product 1 25.90 USD in stock; SKU-10022 Product 2 31.90 USD in stock; SKU-10023 Product 3 37.90 USD out of stock')))
+           ) AS tool_rounds
+    FROM generate_series(1, $N) g
+    SQL;
+
 $typed_cases = [
     'jsonb ~80 B -> array' => [
         "SELECT jsonb_build_object('id', g, 'name', 'user_' || g, 'active', g % 2 = 0, 'score', g * 1.5, 'tags', jsonb_build_array('a', 'b', 'c')) AS doc FROM generate_series(1, $N) g",
@@ -258,6 +276,16 @@ $typed_cases = [
         "SELECT jsonb_build_object('order', g, 'customer', jsonb_build_object('id', g, 'email', 'u' || g || '@example.com', 'address', jsonb_build_object('city', 'Prague', 'zip', '11000')), 'items', (SELECT jsonb_agg(jsonb_build_object('sku', 'SKU-' || g || '-' || j, 'qty', j, 'price', j * 9.99, 'meta', jsonb_build_object('color', 'red', 'size', 'XL', 'note', NULL))) FROM generate_series(0, 9) j)) AS doc FROM generate_series(1, $N) g",
         JsonDto::class,
         fn (array $row) => json_decode($row['doc'], true),
+    ],
+    'chat message, 3 jsonb -> string' => [
+        $chat_message_sql,
+        ChatMessageRawDto::class,
+        fn (array $row) => [$row['values'], $row['blocks'], $row['tool_rounds']],
+    ],
+    'chat message, 3 jsonb -> array' => [
+        $chat_message_sql,
+        ChatMessageDto::class,
+        fn (array $row) => [json_decode($row['values'], true), json_decode($row['blocks'], true), json_decode($row['tool_rounds'], true)],
     ],
     'int4[] 10 items -> array' => [
         "SELECT ARRAY(SELECT g * 10 + j FROM generate_series(1, 10) j) AS values FROM generate_series(1, $N) g",

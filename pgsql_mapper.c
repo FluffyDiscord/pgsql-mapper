@@ -5,6 +5,7 @@
 #include "php.h"
 #include "ext/standard/info.h"
 #include "ext/date/php_date.h"
+#include "ext/json/php_json.h"
 #include "zend_exceptions.h"
 #include "zend_enum.h"
 
@@ -909,20 +910,28 @@ static bool build_json_value(zval *value, yyjson_val *node, int depth)
     return build_json_object(value, node, nesting);
 }
 
-static void convert_pg_json(zval *value, const char *raw, int length)
+static bool decode_json_like_php(zval *value, const char *raw, int length)
 {
-    yyjson_doc *document = yyjson_read_opts((char *)raw, length, YYJSON_READ_ALLOW_INF_AND_NAN, &JSON_ALLOCATOR, NULL);
-    if (document == NULL) {
-        ZVAL_NULL(value);
+    zend_result decoded = php_json_decode_ex(value, raw, length,
+                                             PHP_JSON_OBJECT_AS_ARRAY | PHP_JSON_THROW_ON_ERROR, JSON_MAX_DEPTH);
 
-        return;
+    return decoded == SUCCESS;
+}
+
+static bool convert_pg_json(zval *value, const char *raw, int length)
+{
+    yyjson_doc *document = yyjson_read_opts((char *)raw, length, YYJSON_READ_NOFLAG, &JSON_ALLOCATOR, NULL);
+    if (document == NULL) {
+        return decode_json_like_php(value, raw, length);
     }
 
     bool built = build_json_value(value, yyjson_doc_get_root(document), 0);
     yyjson_doc_free(document);
     if (!built) {
-        ZVAL_NULL(value);
+        return decode_json_like_php(value, raw, length);
     }
+
+    return true;
 }
 
 static bool convert_pg_enum(zval *value, const char *raw, int length, zend_class_entry *enum_class)
@@ -1224,9 +1233,7 @@ static zend_always_inline bool convert_mapped_value(zval *value, const char *raw
 
             return true;
         case CONVERSION_JSON:
-            convert_pg_json(value, raw, length);
-
-            return true;
+            return convert_pg_json(value, raw, length);
         case CONVERSION_PG_ARRAY:
             convert_pg_array(value, raw, length, mapping->array_element_oid, mapping->datetime_class);
 
@@ -2054,6 +2061,7 @@ static const zend_function_entry pgsql_mapper_functions[] = {
 static const zend_module_dep pgsql_mapper_dependencies[] = {
     ZEND_MOD_REQUIRED("pgsql")
     ZEND_MOD_REQUIRED("date")
+    ZEND_MOD_REQUIRED("json")
     ZEND_MOD_END
 };
 

@@ -5,10 +5,10 @@ PHP extension that maps PostgreSQL result rows straight into typed PHP objects. 
 **Features**
 
 - [Typed values](#type-mapping) — `int`, `float`, `bool`, `DateTimeImmutable` and backed enums, not strings
-- [JSON and arrays](#json-and-arrays) — `jsonb` and `int4[]`/`text[]`… straight into PHP arrays, 3.7–13.1x faster than decoding in PHP
+- [JSON and arrays](#json-and-arrays) — `jsonb` and `int4[]`/`text[]`… straight into PHP arrays, 3.6–16.0x faster than decoding in PHP
 - [Nested objects](#nested-objects) — `"address.city"` columns fill `$row->address->city`
-- [Constructors](#constructors) — promoted-only constructors cost 91 ns/row vs 82 ns/row for a plain DTO
-- [Speed](#benchmark) — 82 ns/row vs 517 ns/row for the same mapping in PHP
+- [Constructors](#constructors) — promoted-only constructors cost 100 ns/row vs 88 ns/row for a plain DTO
+- [Speed](#benchmark) — 88 ns/row vs 524 ns/row for the same mapping in PHP
 
 ## Install
 
@@ -131,7 +131,7 @@ readonly class Product
 }
 ```
 
-- `json`/`jsonb` → same as `json_decode($value, true)`. Deeper than 511 levels → `null`.
+- `json`/`jsonb` → same as `json_decode($value, true, 512, JSON_THROW_ON_ERROR)`. Invalid JSON (e.g. non-UTF-8 `client_encoding`) or deeper than 512 levels → `JsonException`, even on a nullable property.
 - JSON scalar (`"text"`, `42`) → `TypeError`.
 - Elements convert like columns: `int4[]` → `int`, `float8[]` → `float`, `bool[]` → `bool`, `timestamptz[]` → `DateTimeImmutable`, anything else → `string`.
 - Multi-dimensional → nested lists. Custom bounds (`[0:2]={…}`) → 0-based list.
@@ -187,9 +187,9 @@ readonly class User
 
 | Class | What happens | [Benchmark](#benchmark) |
 |---|---|---|
-| No constructor | Slots written directly | FlatDto 82 ns/row |
-| Only promoted params, every param has a column | Constructor skipped, slots written directly | AccountDto 91 ns/row |
-| Any other constructor | Called per row; columns matched to params by name, missing params use their defaults | AccountDtoTwo 279 ns/row |
+| No constructor | Slots written directly | FlatDto 88 ns/row |
+| Only promoted params, every param has a column | Constructor skipped, slots written directly | AccountDto 100 ns/row |
+| Any other constructor | Called per row; columns matched to params by name, missing params use their defaults | AccountDtoTwo 277 ns/row |
 | Internal (C) constructor, e.g. extending `Exception` | Called without args; columns written after it | — |
 | `__set` or a custom object handler | Every column goes through a normal property write | — |
 
@@ -208,21 +208,23 @@ Not covered:
 
 | DTO | C (ns/row) | PHP (ns/row) | Speedup |
 |---|---:|---:|---:|
-| `pg_fetch_assoc` loop, no objects | — | 118 | — |
-| FlatDto, no constructor | 82 | 517 | **6.3x** |
-| AccountDto, promoted-only constructor | 91 | 580 | **6.4x** |
-| AccountDtoTwo, custom constructor + nested object | 279 | 1019 | **3.7x** |
+| `pg_fetch_assoc` loop, no objects | — | 116 | — |
+| FlatDto, no constructor | 88 | 524 | **5.9x** |
+| AccountDto, promoted-only constructor | 100 | 580 | **5.8x** |
+| AccountDtoTwo, custom constructor + nested object | 277 | 987 | **3.6x** |
 
 Mapping into a plain DTO is faster than `pg_fetch_assoc` returning plain arrays.
 
 | Column → property | C (ns/row) | PHP baseline | PHP (ns/row) | Speedup |
 |---|---:|---|---:|---:|
-| `jsonb` ~80 B → `array` | 115 | `json_decode` | 474 | **4.1x** |
-| `jsonb` ~1 KB → `array` | 1363 | `json_decode` | 5066 | **3.7x** |
-| `int4[]`, 10 items → `array` | 68 | `explode` + `intval` | 329 | **4.9x** |
-| `text[]`, 5 quoted items → `array` | 75 | `str_getcsv` | 976 | **13.1x** |
-| `timestamptz` → `DateTimeImmutable` | 48 | `new DateTimeImmutable` | 331 | **6.8x** |
-| `date` → `DateTimeImmutable` | 45 | `new DateTimeImmutable` | 353 | **7.8x** |
+| `jsonb` ~80 B → `array` | 117 | `json_decode` | 486 | **4.2x** |
+| `jsonb` ~1 KB → `array` | 1315 | `json_decode` | 5101 | **3.9x** |
+| 3 `jsonb` (~1.1 KB, chat message) → `array` | 842 | `json_decode` | 3027 | **3.6x** |
+| same 3 `jsonb` → `string`, no decoding | 44 | — | 136 | — |
+| `int4[]`, 10 items → `array` | 70 | `explode` + `intval` | 332 | **4.8x** |
+| `text[]`, 5 quoted items → `array` | 59 | `str_getcsv` | 943 | **16.0x** |
+| `timestamptz` → `DateTimeImmutable` | 54 | `new DateTimeImmutable` | 351 | **6.5x** |
+| `date` → `DateTimeImmutable` | 51 | `new DateTimeImmutable` | 380 | **7.5x** |
 
 ### Real project
 

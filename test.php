@@ -110,6 +110,15 @@ class TypedColumnsRow {
     public bool|array $flag;
 }
 
+class NullableJsonRow {
+    public ?array $doc;
+}
+
+class JsonCorpusRow {
+    public int $position;
+    public array $doc;
+}
+
 readonly class AccountDto {
     public function __construct(
         public int $account_id,
@@ -578,6 +587,71 @@ assert($typed[0]->raw_doc === '{"id": 7}');
 assert($typed[0]->flag === false);
 
 echo "jsonb / arrays / date assertions passed.\n\n";
+
+/* ===== Test 12: JSON that json_decode rejects throws JsonException ===== */
+echo "=== Test 12: invalid JSON throws ===\n";
+
+function map_json_error(PgSql\Connection $conn, string $sql): ?JsonException
+{
+    try {
+        pg_fast_query(pg_query($conn, $sql), NullableJsonRow::class);
+    } catch (JsonException $exception) {
+        return $exception;
+    }
+
+    return null;
+}
+
+$too_deep = map_json_error($conn, "SELECT (repeat('[', 600) || repeat(']', 600))::jsonb AS doc");
+assert($too_deep?->getCode() === JSON_ERROR_DEPTH);
+assert($too_deep->getMessage() === 'Maximum stack depth exceeded');
+
+pg_query($conn, "SET client_encoding = 'LATIN1'");
+$not_utf8 = map_json_error($conn, "SELECT ('{\"name\": \"Zo' || chr(235) || '\"}')::jsonb AS doc");
+pg_query($conn, "SET client_encoding = 'UTF8'");
+assert($not_utf8?->getCode() === JSON_ERROR_UTF8);
+
+$at_depth_limit = pg_fast_query(pg_query($conn, "SELECT (repeat('[', 511) || repeat(']', 511))::jsonb AS doc"), NullableJsonRow::class);
+assert(is_array($at_depth_limit[0]->doc));
+
+echo "Invalid JSON assertions passed.\n\n";
+
+/* ===== Test 13: JSON maps to exactly what json_decode returns ===== */
+echo "=== Test 13: JSON matches json_decode ===\n";
+
+$json_corpus = explode("\n", <<<'JSON'
+[0, -0, -0.0, 1, -1, 1e2, 1E-2, 1.5e+3, 0.1, 123456789012345678]
+[9223372036854775807, -9223372036854775808, 9223372036854775808, -9223372036854775809, 12345678901234567890, 1234567890123456789]
+[1.7976931348623157e308, 5e-324, 2.2250738585072014e-308, 0.30000000000000004, 1e400, -1e400]
+["", "a", "ab", "\n\t\r\b\f", "\"\\\/", "é中😀", "\u0000x", "ünïcödé 中文 😀"]
+["𝄞", "€", "\u007f", "\u0080", "߿", "ࠀ", "￿", "mixed é \n ascii"]
+{"b": 1, "a": 2, "b": 3}
+{"0": "zero", "12": "twelve", "-5": "minus", "05": "padded", "1.5": "float", "": "empty", "9223372036854775808": "big"}
+{"nested": {"list": [[], {}, [[]], [{"k": null}]], "flag": true, "off": false}}
+  {"spaced" :  [ 1 ,2 ,	3 ] , "tab":	"x"	}
+{"key with \"escape\"": 1, "é": 2, "ü": 3}
+[true, false, null, [true], {"null": null}]
+JSON);
+$json_corpus[] = "[1,\r\n2,\n3]";
+$json_corpus[] = '{"long": "' . str_repeat('abcdefghij', 100) . '", "long_utf8": "' . str_repeat('příliš žluťoučký ', 40) . '"}';
+
+$corpus_values = [];
+foreach ($json_corpus as $position => $raw) {
+    $corpus_values[] = sprintf('(%d, %s)', $position, pg_escape_literal($conn, $raw));
+}
+$corpus_rows = pg_fast_query(pg_query($conn, 'SELECT position, raw::json AS doc FROM (VALUES ' . implode(', ', $corpus_values) . ') v(position, raw) ORDER BY position'), JsonCorpusRow::class);
+
+foreach ($corpus_rows as $row) {
+    $expected = json_decode($json_corpus[$row->position], true, 512, JSON_THROW_ON_ERROR);
+    if ($row->doc !== $expected) {
+        echo "Mismatch for: {$json_corpus[$row->position]}\n";
+        var_dump($row->doc, $expected);
+    }
+    assert($row->doc === $expected);
+}
+assert(count($corpus_rows) === count($json_corpus));
+
+echo "json_decode parity assertions passed.\n\n";
 
 echo "=== ALL TESTS PASSED ===\n";
 

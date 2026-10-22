@@ -85,6 +85,7 @@ if test "$PHP_PGSQL_MAPPER" != "no"; then
 
   PHP_ADD_EXTENSION_DEP(pgsql_mapper, pgsql)
   PHP_ADD_EXTENSION_DEP(pgsql_mapper, date)
+  PHP_ADD_EXTENSION_DEP(pgsql_mapper, json)
 
   PHP_SUBST(PGSQL_MAPPER_SHARED_LIBADD)
   PHP_NEW_EXTENSION(pgsql_mapper, pgsql_mapper.c, $ext_shared)

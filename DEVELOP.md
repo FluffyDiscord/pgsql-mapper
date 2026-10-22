@@ -8,6 +8,7 @@ A PHP C extension that hydrates PostgreSQL results directly into typed PHP objec
 * **Core Logic:** `pgsql_mapper.c` (main extension) and `php_pgsql_mapper.h` (vendored PgSql structs & OIDs).
 * **Build:** Run `bash build-install.sh` for a full rebuild/install. (Run `phpize && ./configure` first if `config.m4` changes.) Needs system libpq and libyyjson (found via pkg-config); PIE can't install either.
 * **Tests:** Run `php test.php` (Requires local PG at `127.0.0.1:15432`, db=`postgres_air`, user=`app`).
+* **JSON fixtures:** `git clone https://github.com/ibireme/yyjson /tmp/yyjson && php test_json_fixtures.php /tmp/yyjson/test/data` — every yyjson fixture must map to exactly what `json_decode` returns or throws. Same DB; `app` must be a superuser (the script adds a temporary `bytea → json` cast to get invalid JSON past Postgres).
 
 ## Architecture
 * **Execution Paths:**
@@ -18,10 +19,11 @@ A PHP C extension that hydrates PostgreSQL results directly into typed PHP objec
 * **Object Mapping:**
     * **Dot Notation:** Columns like `"address.city"` map to `$obj->address->city` (max depth: 8). Instances are reused if referenced multiple times.
     * **Auto-nesting:** If a column targets a user class, the extension auto-creates the object and sets the value on its **first declared property**.
-* **Type Conversion:** PostgreSQL OIDs map to `int`, `float` (incl. NaN/±INF), `bool`, `DateTimeImmutable` (timestamps), and `string` (fallback). On the fast path, `resolve_conversion()` picks a type-directed `column_conversion` from the property type: backed enum, `date` → UTC midnight, `json`/`jsonb` → array (yyjson, `json_decode` semantics), PG array text → list (`parse_pg_array()`). A property that accepts `string` keeps the raw value.
+* **Type Conversion:** PostgreSQL OIDs map to `int`, `float` (incl. NaN/±INF), `bool`, `DateTimeImmutable` (timestamps), and `string` (fallback). On the fast path, `resolve_conversion()` picks a type-directed `column_conversion` from the property type: backed enum, `date` → UTC midnight, `json`/`jsonb` → array (`convert_pg_json()`, see below), PG array text → list (`parse_pg_array()`). A property that accepts `string` keeps the raw value.
 * **Direct writes:** `can_write_directly()` decides per value: `null` → `accepts_null`, array → `accepts_array`, anything else → `skip_type_check`. JSON/array conversions never skip the check, so a scalar JSON value goes through normal assignment.
 * **Per-call plan:** `build_query_plan()` resolves columns, constructor params and the constructor call once; `hydrate_row()` only reads cells and writes slots.
 * **Timestamps:** `parse_iso_timestamptz()` + `initialize_offset_time()` build ISO-style `timestamptz` values directly (no strtotime). Other shapes (`timestamp` without zone, non-ISO `DateStyle`, `infinity`) go through `php_date_initialize()`.
+* **JSON:** `convert_pg_json()` parses with yyjson (no read flags — `NaN`/`Infinity` rejected like `json_decode`) and builds the PHP array from its tree. Anything yyjson rejects, or deeper than 511 levels, goes to ext/json's `php_json_decode_ex()` with `JSON_THROW_ON_ERROR`, so values and errors always match `json_decode`. A home-grown one-pass decoder was tried and dropped: 5–10% faster, not worth ~600 lines — the rest is PHP allocating the arrays and strings.
 * **Vendored Structs:** The internal structs in `php_pgsql_mapper.h` **must** match the PHP version being compiled against.
 
 ## Adding a New Type Mapping

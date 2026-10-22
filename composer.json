@@ -4,6 +4,9 @@
     "type": "php-ext",
     "keywords": ["postgresql", "pgsql", "extension", "mapper", "performance", "dto"],
     "license": "MIT",
+    "php-ext": {
+        "extension-name": "pgsql_mapper"
+    },
     "require": {
         "php": ">=8.5",
         "fluffydiscord/fast-pgsql-mapper-stubs": "*"

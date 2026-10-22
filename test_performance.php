@@ -155,10 +155,10 @@ echo sprintf("PHP FlatDto (fetch_assoc + assign):   %8.1f ns/row   speedup: %.2f
 echo "\n";
 
 // -------------------------------------------------------------------------
-// AccountDto — trivial promoted-only ctor (C bypasses VM via is_trivial_promoted_ctor)
+// AccountDto — promoted-only ctor (C skips it via can_skip_promoted_ctor)
 // -------------------------------------------------------------------------
 
-// C extension: trivial ctor detection → still uses fast-path slot writes
+// C extension: promoted ctor skipped → fast-path slot writes
 $rc_adt = pg_query($conn, $flat_sql);
 pg_fast_query($rc_adt, AccountDto::class); // warmup
 $best = PHP_INT_MAX;
@@ -168,7 +168,7 @@ for ($run = 0; $run < $iters; $run++) {
     $best = min($best, hrtime(true) - $t0);
 }
 $ns_c_adt = $best / $N;
-echo sprintf("C  AccountDto (trivial ctor → fast):  %8.1f ns/row\n", $ns_c_adt);
+echo sprintf("C  AccountDto (promoted ctor → fast): %8.1f ns/row\n", $ns_c_adt);
 
 // PHP manual: pg_fetch_assoc + new AccountDto(...) via constructor
 $r_adt = pg_query($conn, $flat_sql);

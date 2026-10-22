@@ -4,7 +4,7 @@ PHP_ARG_ENABLE([pgsql_mapper],
   [whether to enable pgsql_mapper support],
   [AS_HELP_STRING([--enable-pgsql_mapper],
     [Enable pgsql_mapper support])],
-  [no])
+  [yes])
 
 if test "$PHP_PGSQL_MAPPER" != "no"; then
 
@@ -61,10 +61,4 @@ if test "$PHP_PGSQL_MAPPER" != "no"; then
 
   PHP_SUBST(PGSQL_MAPPER_SHARED_LIBADD)
   PHP_NEW_EXTENSION(pgsql_mapper, pgsql_mapper.c, $ext_shared)
-
-  dnl Tier 3: Release build optimizations (skip for debug builds)
-  if test "$PHP_DEBUG" = "no"; then
-    CFLAGS="$CFLAGS -O3 -fvisibility=hidden -flto"
-    LDFLAGS="$LDFLAGS -flto"
-  fi
 fi

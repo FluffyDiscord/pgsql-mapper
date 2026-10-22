@@ -1,4 +1,6 @@
-# pgsql fast "raw row -> php object" mapper
+# pgsql-mapper
+
+PHP extension that maps PostgreSQL result rows straight into typed PHP objects. PHP 8.5+, `ext/pgsql` results.
 
 > [!WARNING]
 > **This extension was written by AI (Claude) and is NOT production-ready.**
@@ -6,169 +8,189 @@
 > crashes, or other issues arising from its use. No guarantees are made regarding
 > correctness, stability, or security.
 
-Claude created php extension to map postgresql rows to php objects right in
-the C language, with caveats of course, to make it faster.
+**Features**
 
-This makes it **~1.5–2.0x faster** than doing it manually in PHP, or using something like `PDO::FETCH_CLASS`,
-which maps only strings, and is also slow, so it's terrible.
+- [Typed values](#type-mapping) — `int`, `float`, `bool`, `DateTimeImmutable` and backed enums, not strings
+- [Nested objects](#nested-objects) — `"address.city"` columns fill `$row->address->city`
+- [Constructors](#constructors) — promoted-only constructors are skipped: 97 ns/row vs 84 ns/row for a plain DTO
+- [Speed](#benchmark) — 84 ns/row vs 515 ns/row for the same mapping in PHP
 
-### Acknowledgment
+## Install
 
-From the limited amount of manual testing, extension seems to be somewhat stable, not to crash
-php with segfault or other weird errors. If you name columns wrong, it will skip them,
-if you set property type of string but return integer from database, it will be casted to string,
-and vice versa. It does however breaks quite a lot of PHP assumptions (inheritance for example).
-**I have not tested PHP hooks**, because i don't use them, but my guess is that they are not supported.
+```bash
+bash build-install.sh
+```
 
-### API
+Needs `gcc`, `make`, PHP dev headers, libpq headers and `ext/pgsql`. The script names any missing package for your distro.
 
-New function provided by this extension:
+IDE stubs:
+
+```bash
+composer require --dev fluffydiscord/fast-pgsql-mapper-stubs
+```
+
+## Usage
+
+1. `src/AccountRow.php`
+
+   ```php
+   readonly class AccountRow
+   {
+       public int $id;
+       public string $login;
+       public ?DateTimeImmutable $updatedAt;
+   }
+   ```
+
+2. Query and map:
+
+   ```php
+   $result = pg_query($connection, 'SELECT id, login, update_ts AS "updatedAt" FROM account');
+
+   /** @var list<AccountRow> $rows */
+   $rows = pg_fast_query($result, AccountRow::class);
+   ```
+
+**Columns match properties by name.** Public, protected and private all work. Same speed for each.
+
+## Type mapping
+
+| PostgreSQL | PHP |
+|---|---|
+| `int2`, `int4`, `int8` | `int` |
+| `float4`, `float8` | `float` (`NaN`, `Infinity` → `NAN`, `INF`) |
+| `bool` | `bool` |
+| `timestamp`, `timestamptz` | `DateTimeImmutable` |
+| `NULL` | `null` |
+| anything else (`numeric`, `text`, `date`, `json`, `uuid`, arrays…) | `string` |
+
+**Value doesn't fit the property → normal PHP property assignment (coercive mode):**
+
+| Case | Result |
+|---|---|
+| `5` into `string` | `'5'` |
+| `'42'` into `int` | `42` |
+| `'abc'` into `int` | `TypeError` |
+| `NULL` into non-nullable | `TypeError` |
+| Column with no matching property | skipped |
+| Property with no column | left uninitialized |
+| Property with a hook | skipped |
+
+### Datetime
+
+**Type a property as a `DateTimeImmutable` subclass to get that class:**
 
 ```php
-\pg_fast_query(\PgSql\Result $result, string $class): array
+public ?\Carbon\CarbonImmutable $createdAt; // CarbonImmutable, not DateTimeImmutable
 ```
 
-There are two ways to define your classes (DTOs).
+- The subclass constructor isn't called, same as Carbon's own `modify()` etc.
+- Subclass with its own required typed property and no default → that property stays uninitialized. Don't use one here.
+- Internal subclass with a different object layout → plain `DateTimeImmutable`.
 
-**Optimal way is to NOT extend any other DTO and to NOT use constructor**, see examples bellow. 
+**Unparsed values → `null`** (`TypeError` on a non-nullable property): `infinity`, `-infinity`, BC `timestamp` without zone, and any timestamp in a `DateStyle` other than ISO.
 
-```php
-// you can nest objects arbitrarily :)
-readonly class TestNested {
-    public int $price;
-    public ?\DateTimeImmutable $createdAt = null;
-}
+> `timestamptz` in ISO `DateStyle` (the default) skips PHP's generic date parser: 62 ns vs 233 ns per value. `timestamp` without zone and other styles use the generic parser.
 
-// supported, but not recommended, do not use constructor,
-// if not required, its way slower, see results at the end
-readonly class AccountDto {
-    public function __construct(
-        public int $account_id,
-        public string $login,
-        public string $first_name,
-        public string $last_name,
-        public ?int $frequent_flyer_id = null,
-        public ?\DateTimeImmutable $update_ts = null,
-    ) {}
-}
+### Backed enums
 
-// supported, but not recommended, do not use constructor,
-// if not required, its way slower, see results at the end
-readonly class AccountDtoTwo extends AccountDto
-{
-    public function __construct(
-        int $account_id,
-        int $login2,
-        string $first_name,
-        string $last_name,
-        ?int $frequent_flyer_id = null,
-        ?\DateTimeImmutable $update_ts = null,
-        public TestNested $nested,
-    ) {
-        parent::__construct($account_id, (string)$login2, $first_name, $last_name, $frequent_flyer_id, $update_ts);
-    }
-}
-
-// recommended way, no contructor, no inheritance, still be able to use object nesting
-// properties can be private, and you just create a getter, setters are not needed
-readonly class FlatDto {
-    public int $account_id;
-    public string $login;
-    public string $first_name;
-    public string $last_name;
-    public ?int $frequent_flyer_id;
-    public ?\DateTimeImmutable $update_ts;
-    public TestNested $nested,
-}
-```
-
-To use nested objects, you need to name your columns with dot path, eg. from above
-```sql
-SELECT account_id, price as "nested.price", created_at as "nested.createdAt" FROM your_table;
-```
-If you have single value objects for example like bellow
-
-```php
-readonly class Email {
-    private ?string $email;
-    
-    public function isValid() {
-        return $this->email !== null;    
-    }
-}
-```
-
-You don't need to use the dot path to set "nested.email" value, but you can just name is as "nested",
-the C extension auto picks first property in class and sets its value to that.
-
-### Datetime columns (type-directed)
-
-`timestamp` / `timestamptz` columns hydrate into `\DateTimeImmutable` by default. On the fast
-path (no constructor, direct property), if the destination property is typed as a **concrete
-subclass of `\DateTimeImmutable`**, the extension instantiates that exact class into the slot:
-
-```php
-readonly class Row {
-    public int $id;
-    public ?\Carbon\CarbonImmutable $created_at; // hydrated as CarbonImmutable, not DateTimeImmutable
-}
-```
-
-The instance is built through the date extension's object handler (the PHP `__construct` is
-bypassed — the same way `DateTimeImmutable`/Carbon mint instances from `modify()` etc.). Only
-subclasses that are safe to mint this way are supported:
-- **pure-PHP subclasses** (e.g. `Carbon\CarbonImmutable`) — supported;
-- a subclass that declares its own **required typed property with no default** would be left
-  uninitialized (accessing it throws) — don't use such a class here;
-- an internal class with a different object layout is ignored (falls back to `DateTimeImmutable`).
-
-Constructor and `__set`/`create_object` (non-fast-path) classes always receive `\DateTimeImmutable`.
-
-### Backed enum columns (type-directed)
-
-On the fast path, if the destination property is typed as a **backed enum** whose backing kind
-matches the column, the value is mapped to the enum **case** (via the same lookup `Enum::from()`
-uses — the case singleton, no allocation) instead of a raw string/int:
+**Type a property as a backed enum to get the case:**
 
 ```php
 enum Status: string { case Active = 'active'; case Ended = 'ended'; }
 
-readonly class Row {
-    public int $id;
-    public Status $status;   // 'active' text column -> Status::Active
-    public ?Status $maybe;   // NULL column -> null
+readonly class Row
+{
+    public Status $status;   // 'active' → Status::Active
+    public ?Status $maybe;   // NULL → null
 }
 ```
 
-- string-backed enum ← text column; int-backed enum ← integer column (mismatched backing/column is
-  left as the raw value).
-- Unknown value → `ValueError` (from() semantics), matching `Enum::from()`.
-- Pure (non-backed) enums are not mapped. Constructor / non-fast-path classes receive the raw value.
+- String-backed ← text columns. Int-backed ← integer columns. Other pairs → raw value.
+- Unknown value → `ValueError`, same as `Status::from()`.
+- Pure (non-backed) enums aren't mapped.
 
-### Build
-- `bash build-install.sh`
+## Nested objects
 
-### Last results
+**Name columns with a dot path:**
 
-Measured with a fair benchmark (`test_performance.php`, 5000 rows, best of 10 runs, PHP 8.5):
-PHP baselines include `pg_fetch_assoc` per row inside the timing loop, matching the data-access
-cost the C extension pays reading from `PGresult`.
+```sql
+SELECT id, price AS "nested.price", created_at AS "nested.createdAt" FROM orders
+```
 
-| Path                                         | C (ns/row) | PHP (ns/row) | Speedup |
-|----------------------------------------------|----------:|-------------:|--------:|
-| Raw `pg_fetch_assoc` loop (no objects)       |         — |          122 |       — |
-| FlatDto — no constructor (fast path)         |       253 |          520 |  **2.05x** |
-| AccountDto — promoted-only ctor (fast path)  |       360 |          571 |  **1.59x** |
-| AccountDtoTwo — complex ctor + nested object |       655 |          985 |  **1.50x** |
+```php
+readonly class Nested
+{
+    public int $price;
+    public ?DateTimeImmutable $createdAt;
+}
 
-The fast path (no constructor, no inheritance) gives the best speedup because the C extension
-writes directly to property slots without going through the PHP VM. Once a constructor is
-involved, the VM must execute per row and the advantage shrinks to ~1.5x.
+readonly class Order
+{
+    public int $id;
+    public Nested $nested;
+}
+```
 
-**On a real project**, test results are promising. With this extension, mapping to an arbitrary object
-with no constructor (the most optimal way) results in basically the same speed as returning plain array,
-which is incredible to see. We get free strictly typed and mapped object right from the database with
-no additional processing cost, and with lower peak memory usage.
+- Up to 8 levels.
+- Nested classes are created without calling their constructor.
+
+**Single-value objects need no dot path.** A column named after a class-typed property fills that class's first declared property, any visibility:
+
+```php
+readonly class Email
+{
+    private ?string $email;
+
+    public function isValid(): bool
+    {
+        return $this->email !== null;
+    }
+}
+
+readonly class User
+{
+    public Email $email;   // SELECT email FROM users → $user->email->isValid()
+}
+```
+
+## Constructors
+
+| Class | What happens | [Benchmark](#benchmark) |
+|---|---|---|
+| No constructor | Slots written directly | FlatDto 84 ns/row |
+| Only promoted params, every param has a column | Constructor skipped, slots written directly | AccountDto 97 ns/row |
+| Any other constructor | Called per row; columns matched to params by name, missing params use their defaults | AccountDtoTwo 356 ns/row |
+| `__set` or a custom object handler | Every column goes through a normal property write | — |
+
+> Constructor args get raw values: enum and `DateTimeImmutable` subclass mapping don't apply. Columns the constructor doesn't take are written after it runs.
+>
+> Dot columns for a constructor param's object (`"nested.x"`) are written only when the type already fits. `'42'` into `int` is dropped, not cast.
+
+Not covered:
+
+- Nesting, enum or subclass mapping through union or intersection types
+- Hooked properties
+- Nesting below a class with `__set` or a custom object handler
+
+## Benchmark
+
+`test_performance.php`, 5000 rows, best of 10 runs, PHP 8.5.12, opcache on. PHP baselines call `pg_fetch_assoc` per row inside the timed loop.
+
+| Path | C (ns/row) | PHP (ns/row) | Speedup |
+|---|---:|---:|---:|
+| `pg_fetch_assoc` loop, no objects | — | 118 | — |
+| FlatDto, no constructor | 84 | 515 | **6.1x** |
+| AccountDto, promoted-only constructor | 97 | 580 | **6.0x** |
+| AccountDtoTwo, custom constructor + nested object | 356 | 1064 | **3.0x** |
+
+Mapping into a plain DTO is faster than `pg_fetch_assoc` returning arrays.
+
+### Real project
+
+`wrk -t4 -c12 -d20s --latency`, baseline raw-pg.
+
+> Measured with v1.1.0 or earlier.
 
 | Endpoint | Req/sec | Avg Lat | p99 Lat | Peak Mem | vs raw-pg |
 | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -179,11 +201,9 @@ no additional processing cost, and with lower peak memory usage.
 | cycle | 795.25 | 15.20ms | 22.30ms | 26.00 MB | 5.29x slower |
 | doctrine | 892.82 | 13.58ms | 19.83ms | 18.00 MB | 4.71x slower |
 
-Baseline: raw-pg | wrk: -t4 -c12 -d20s --latency
-
-- **raw-pg** - pg_query_params() + pg_fetch_all(); rows returned as raw associative arrays — no mapping.
-- **raw-dto** - pg_query_params() + pg_fetch_assoc() in a while loop; each row immediately mapped into an object with constructor in php. Note: there was no measurable difference between pg_fetch_all and foreach vs pg_fetch_assoc in while loop
-- **pg-fast** - pg_query() + pg_fast_query() userland helper; deserializes rows directly into an object via this extension.
-- **pg-fast-inh** - Same as pg-fast but targets object extending another object (child class), both with constructors; tests overhead of inheritance in the deserialization path.
-- **cycle** - Cycle ORM Select + fetchAll(); returns fully hydrated CycleAccount entities with identity map.
-- **doctrine** - Doctrine EntityManager findBy(); returns fully hydrated Account entities with lazy-loading and identity map.
+- **raw-pg** — `pg_query_params()` + `pg_fetch_all()`, plain arrays.
+- **raw-dto** — `pg_fetch_assoc()` loop, each row mapped through a PHP constructor.
+- **pg-fast** — `pg_query()` + `pg_fast_query()`.
+- **pg-fast-inh** — same, into a child class; both classes have constructors.
+- **cycle** — Cycle ORM `Select` + `fetchAll()`, identity map.
+- **doctrine** — Doctrine `findBy()`, lazy loading and identity map.

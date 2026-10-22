@@ -71,6 +71,36 @@ class TestNested {
     public ?\DateTimeImmutable $ts = null;
 }
 
+enum Status: string {
+    case Active = 'active';
+    case Ended = 'ended';
+}
+
+class PrivateRow {
+    private int $id;
+    protected string $name;
+
+    public function getId(): int { return $this->id; }
+    public function getName(): string { return $this->name; }
+}
+
+readonly class PromotedRow {
+    public function __construct(
+        public int $id,
+        public Status $status,
+        public DateTimeImmutable $created_at,
+    ) {}
+}
+
+class PrivatePromotedParent {
+    public function __construct(private int $id) {}
+    public function getParentId(): ?int { return $this->id; }
+}
+
+class PrivatePromotedChild extends PrivatePromotedParent {
+    public int $id;
+}
+
 readonly class AccountDto {
     public function __construct(
         public int $account_id,
@@ -476,6 +506,48 @@ assert($accounts[1]->update_ts === null);
 assert($accounts[1]->nested instanceof TestNested);
 
 echo "\nConstructor with parent assertions passed.\n\n";
+
+/* ===== Test 8: private/protected properties ===== */
+echo "=== Test 8: private/protected properties ===\n";
+
+$private = pg_fast_query(pg_query($conn, "SELECT 5 AS id, 'Eve' AS name"), PrivateRow::class);
+assert($private[0]->getId() === 5);
+assert($private[0]->getName() === 'Eve');
+
+echo "Private/protected assertions passed.\n\n";
+
+/* ===== Test 9: promoted-only constructor with every param mapped (constructor skipped) ===== */
+echo "=== Test 9: promoted-only constructor ===\n";
+
+$promoted = pg_fast_query(pg_query($conn, "SELECT 1 AS id, 'ended' AS status, '2025-06-15 10:30:00+00'::timestamptz AS created_at"), PromotedRow::class);
+assert($promoted[0]->id === 1);
+assert($promoted[0]->status === Status::Ended);
+assert($promoted[0]->created_at->format('c') === '2025-06-15T10:30:00+00:00');
+
+$inherited = pg_fast_query(pg_query($conn, "SELECT 7 AS id"), PrivatePromotedChild::class);
+assert($inherited[0]->getParentId() === 7);
+
+echo "Promoted constructor assertions passed.\n\n";
+
+/* ===== Test 10: timestamptz values match DateTimeImmutable parsing ===== */
+echo "=== Test 10: timestamptz in a non-UTC session ===\n";
+
+pg_query($conn, "SET TimeZone = 'Asia/Kolkata'");
+$result = pg_query($conn, "
+    SELECT ts AS created_at, ts::text AS raw FROM (VALUES
+        ('2025-06-15 10:30:00.123456+00'::timestamptz),
+        ('1850-01-01 00:00:00+00'::timestamptz),
+        ('0044-03-15 12:00:00+00 BC'::timestamptz)
+    ) v(ts)
+");
+$raw = pg_fetch_all_columns($result, 1);
+$stamps = pg_fast_query($result, UserRow::class);
+assert($stamps[0]->created_at->format('Y-m-d H:i:s.u P') === (new DateTimeImmutable($raw[0]))->format('Y-m-d H:i:s.u P'));
+assert($stamps[1]->created_at->format('Y-m-d H:i:s P') === (new DateTimeImmutable($raw[1]))->format('Y-m-d H:i:s P'));
+assert($stamps[2]->created_at->format('Y-m-d') === '-0043-03-15');
+pg_query($conn, "SET TimeZone = 'UTC'");
+
+echo "timestamptz assertions passed.\n\n";
 
 echo "=== ALL TESTS PASSED ===\n";
 

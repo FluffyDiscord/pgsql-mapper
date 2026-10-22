@@ -15,32 +15,14 @@ extern zend_module_entry pgsql_mapper_module_entry;
 #define phpext_pgsql_mapper_ptr &pgsql_mapper_module_entry
 
 /* ----------------------------------------------------------------
- * Vendored PgSql\Connection internal struct.
+ * Vendored PgSql\Result internal struct.
  *
- * PHP's ext/pgsql keeps this struct static — not exported.
- * We replicate the layout so we can extract PGconn* from the
- * zend_object* that backs a PgSql\Connection instance.
- * This MUST match the layout in ext/pgsql/pgsql_driver.c / php_pgsql.h.
+ * ext/pgsql does not install its headers, so the layout is replicated
+ * to extract PGresult* from the zend_object* backing a PgSql\Result.
+ * This MUST match pgsql_result_handle in ext/pgsql/php_pgsql.h.
  * ---------------------------------------------------------------- */
 typedef struct {
     PGconn *conn;
-    zend_string *hash;
-    HashTable *notices;
-    bool persistent;
-    zend_object std;            /* must be last — standard zend_object */
-} pgsql_link_handle;
-
-static inline pgsql_link_handle *pgsql_link_from_obj(zend_object *obj) {
-    return (pgsql_link_handle *)((char *)obj - XtOffsetOf(pgsql_link_handle, std));
-}
-
-/* ----------------------------------------------------------------
- * Vendored PgSql\Result internal struct.
- *
- * Same approach as above — replicate the layout to extract PGresult*.
- * This MUST match the layout in ext/pgsql/php_pgsql.h.
- * ---------------------------------------------------------------- */
-typedef struct {
     PGresult *result;
     int row;
     zend_object std;                /* must be last — standard zend_object */

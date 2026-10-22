@@ -155,7 +155,7 @@ echo sprintf("PHP FlatDto (fetch_assoc + assign):   %8.1f ns/row   speedup: %.2f
 echo "\n";
 
 // -------------------------------------------------------------------------
-// AccountDto — promoted-only ctor (C skips it via can_skip_promoted_ctor)
+// AccountDto — promoted-only ctor (C skips it via can_skip_promoted_constructor)
 // -------------------------------------------------------------------------
 
 // C extension: promoted ctor skipped → fast-path slot writes

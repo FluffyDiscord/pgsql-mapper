@@ -1,17 +1,8 @@
-/*
- * pgsql_mapper.c — pg_fast_query() implementation
- *
- * Hydrates PostgreSQL rows directly into typed PHP objects from C,
- * bypassing intermediate userland arrays. Supports nested object mapping
- * via dot-delimited column names (e.g. SELECT account_id AS "address.id").
- */
-
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
 
 #include "php.h"
-#include "php_ini.h"
 #include "ext/standard/info.h"
 #include "ext/date/php_date.h"
 #include "zend_exceptions.h"
@@ -20,154 +11,326 @@
 #include "php_pgsql_mapper.h"
 
 #define MAX_NESTING_DEPTH 8
+#define NOT_MAPPED -1
+#define INVALID_DIGITS -1
 
-/* ----------------------------------------------------------------
- * Column-to-property mapping with nested object support.
- *
- * depth == 1: flat property on root object
- * depth > 1:  dot-separated path (or auto-expanded class-typed flat prop)
- *
- * ces[i] is the CE of the object that OWNS the property at level i.
- * ces[0] = root CE. ces[i] for i>0 is resolved from props[i-1]'s type.
- * ---------------------------------------------------------------- */
+#define MIN_ISO_TIMESTAMPTZ_LENGTH 22
+#define ISO_FRACTION_POSITION 19
+#define ISO_SEPARATOR_COUNT 5
+#define ISO_OFFSET_PART_COUNT 3
+#define ISO_OFFSET_PART_WIDTH 2
+#define ISO_BC_SUFFIX " BC"
+#define ISO_BC_SUFFIX_LENGTH (sizeof(ISO_BC_SUFFIX) - 1)
+#define MICROSECOND_DIGITS_SCALE 100000
+
+#define SECONDS_PER_MINUTE 60
+#define SECONDS_PER_HOUR 3600
+#define SECONDS_PER_DAY 86400
+#define DAYS_PER_400_YEARS 146097
+#define DAYS_FROM_MARCH_YEAR_ZERO_TO_EPOCH 719468
+
+#define NOT_INSTANTIABLE_CLASS_FLAGS (ZEND_ACC_INTERFACE | ZEND_ACC_TRAIT | ZEND_ACC_ENUM \
+    | ZEND_ACC_IMPLICIT_ABSTRACT_CLASS | ZEND_ACC_EXPLICIT_ABSTRACT_CLASS)
+
+typedef enum {
+    FIELD_YEAR,
+    FIELD_MONTH,
+    FIELD_DAY,
+    FIELD_HOUR,
+    FIELD_MINUTE,
+    FIELD_SECOND,
+    ISO_FIELD_COUNT,
+} iso_field_index;
+
+typedef struct {
+    int position;
+    int width;
+    int minimum;
+    int maximum;
+} iso_field;
+
+typedef struct {
+    int position;
+    char separator;
+} iso_separator;
+
+static const iso_field ISO_DATE_TIME_FIELDS[ISO_FIELD_COUNT] = {
+    {0, 4, 0, 9999},
+    {5, 2, 1, 12},
+    {8, 2, 1, 31},
+    {11, 2, 0, 23},
+    {14, 2, 0, 59},
+    {17, 2, 0, 59},
+};
+
+static const iso_separator ISO_DATE_TIME_SEPARATORS[ISO_SEPARATOR_COUNT] = {
+    {4, '-'},
+    {7, '-'},
+    {10, ' '},
+    {13, ':'},
+    {16, ':'},
+};
+
+static const int ISO_OFFSET_PART_SECONDS[ISO_OFFSET_PART_COUNT] = {
+    SECONDS_PER_HOUR,
+    SECONDS_PER_MINUTE,
+    1,
+};
+
+typedef struct {
+    int fields[ISO_FIELD_COUNT];
+    int microsecond;
+    int utc_offset;
+} iso_timestamp;
+
+typedef struct {
+    bool skip_type_check;
+    bool accepts_null;
+} slot_type_check;
+
 typedef struct {
     int depth;
     zend_string *names[MAX_NESTING_DEPTH];
-    zend_class_entry *ces[MAX_NESTING_DEPTH];
-    zend_property_info *props[MAX_NESTING_DEPTH];
-    uint32_t offsets[MAX_NESTING_DEPTH];
-    zend_class_entry *datetime_ce;
-    zend_class_entry *enum_ce;
-    bool skip_type_check;
-    bool accepts_null;
+    zend_class_entry *owner_classes[MAX_NESTING_DEPTH];
+    zend_property_info *properties[MAX_NESTING_DEPTH];
+    uint32_t property_offsets[MAX_NESTING_DEPTH];
+    zend_class_entry *datetime_class;
+    zend_class_entry *enum_class;
+    slot_type_check type_check;
     bool valid;
-} col_mapping;
+} column_mapping;
 
-/* Per-property mapping for constructor dot-column nesting */
 typedef struct {
-    int col_idx;
-    uint32_t prop_offset;
-    bool skip_type_check;
-    bool accepts_null;
-} ctor_nest_prop;
+    Oid oid;
+    zend_string *name;
+    bool is_constructor_argument;
+    bool skip_property_write;
+    column_mapping mapping;
+} column_plan;
 
-/* Info for building a nested object from dot-columns for a ctor param */
 typedef struct {
-    zend_class_entry *ce;
-    uint32_t count;
-    ctor_nest_prop *props;
-} ctor_nest_info;
+    int column;
+    zend_property_info *property;
+    zend_string *name;
+    slot_type_check type_check;
+} nested_column;
 
-/* ----------------------------------------------------------------
- * Helpers
- * ---------------------------------------------------------------- */
+typedef struct {
+    int column;
+    zend_class_entry *nested_class;
+    uint32_t nested_column_count;
+    nested_column *nested_columns;
+} constructor_param;
 
-/* Resolve class entry from a property's declared type.
- * Returns NULL for untyped, union/intersection, or non-class types. */
-static zend_class_entry *resolve_property_class(zend_property_info *prop)
+typedef struct {
+    PGresult *result;
+    zend_class_entry *target_class;
+    zend_class_entry *default_datetime_class;
+    bool is_fast_path;
+    int column_count;
+    column_plan *columns;
+    bool all_columns_skipped;
+    zend_function *constructor;
+    uint32_t constructor_param_count;
+    constructor_param *constructor_params;
+    uint32_t argument_count;
+    bool use_named_arguments;
+    zval *positional_arguments;
+    HashTable named_arguments;
+    zval constructor_return;
+    zend_fcall_info constructor_call;
+    zend_fcall_info_cache constructor_call_cache;
+} query_plan;
+
+static zend_class_entry *pgsql_result_class;
+
+static zend_class_entry *resolve_type_class(zend_type type)
 {
-    if (!prop || !ZEND_TYPE_IS_SET(prop->type)) return NULL;
-    if (!ZEND_TYPE_HAS_NAME(prop->type)) return NULL;
-    return zend_lookup_class(ZEND_TYPE_NAME(prop->type));
-}
-
-/* Pick the class to instantiate for a timestamp/timestamptz leaf property.
- * A property typed as a concrete subclass of DateTimeImmutable (e.g.
- * Carbon\CarbonImmutable) is instantiated as that exact class so the value
- * lands directly in its typed slot; otherwise DateTimeImmutable is used.
- * The date extension's create_object handler (inherited by the subclass)
- * sizes the php_date_obj for the subclass — Carbon's PHP __construct is
- * bypassed, matching how Carbon's own immutable operations mint instances. */
-static zend_class_entry *resolve_datetime_ce(zend_property_info *prop,
-                                             zend_class_entry *default_immutable_ce)
-{
-    if (!prop || !ZEND_TYPE_IS_SET(prop->type)) return default_immutable_ce;
-    if (!ZEND_TYPE_HAS_NAME(prop->type)) return default_immutable_ce;
-
-    zend_class_entry *type_ce = zend_lookup_class(ZEND_TYPE_NAME(prop->type));
-    if (!type_ce) return default_immutable_ce;
-    if (type_ce->ce_flags & (ZEND_ACC_ABSTRACT | ZEND_ACC_INTERFACE)) return default_immutable_ce;
-    if (!instanceof_function(type_ce, default_immutable_ce)) return default_immutable_ce;
-
-    /* The subclass must reuse the date extension's object handler so
-     * php_date_instantiate yields a correctly sized php_date_obj. A pure-PHP
-     * subclass (Carbon) inherits it; an internal class with its own layout
-     * would not — fall back rather than instantiate an incompatible object. */
-    if (type_ce->create_object != default_immutable_ce->create_object) return default_immutable_ce;
-
-    return type_ce;
-}
-
-/* Pick the backed-enum class for a column whose fast-path property is typed as
- * one, when the enum's backing kind matches the column: int-backed ← integer
- * columns, string-backed ← text-ish columns (anything not natively parsed as
- * int/float/bool/timestamp). Returns NULL when it does not apply (kept raw). */
-static zend_class_entry *resolve_enum_ce(zend_property_info *prop, Oid oid)
-{
-    if (!prop || !ZEND_TYPE_IS_SET(prop->type)) return NULL;
-    if (!ZEND_TYPE_HAS_NAME(prop->type)) return NULL;
-
-    zend_class_entry *type_ce = zend_lookup_class(ZEND_TYPE_NAME(prop->type));
-    if (!type_ce) return NULL;
-    if (!(type_ce->ce_flags & ZEND_ACC_ENUM)) return NULL;
-
-    uint32_t backing = type_ce->enum_backing_type;
-
-    if (backing == IS_LONG) {
-        bool int_col = (oid == PG_OID_INT2 || oid == PG_OID_INT4 || oid == PG_OID_INT8);
-        return int_col ? type_ce : NULL;
+    if (!ZEND_TYPE_HAS_NAME(type)) {
+        return NULL;
     }
 
-    if (backing == IS_STRING) {
-        bool scalar_col = (oid == PG_OID_INT2 || oid == PG_OID_INT4 || oid == PG_OID_INT8
-            || oid == PG_OID_FLOAT4 || oid == PG_OID_FLOAT8 || oid == PG_OID_BOOL
-            || oid == PG_OID_TIMESTAMP || oid == PG_OID_TIMESTAMPTZ);
-        return scalar_col ? NULL : type_ce;
+    return zend_lookup_class(ZEND_TYPE_NAME(type));
+}
+
+static bool is_fast_path_class(const zend_class_entry *class_entry)
+{
+    if (class_entry->__set != NULL) {
+        return false;
     }
+
+    return class_entry->create_object == NULL;
+}
+
+static bool is_nestable_class(zend_class_entry *class_entry)
+{
+    bool is_instantiable = (class_entry->ce_flags & NOT_INSTANTIABLE_CLASS_FLAGS) == 0;
+    if (!is_instantiable) {
+        return false;
+    }
+
+    bool is_date = instanceof_function(class_entry, php_date_get_interface_ce());
+    if (is_date) {
+        return false;
+    }
+
+    return is_fast_path_class(class_entry);
+}
+
+static zend_class_entry *resolve_nestable_class(zend_type type)
+{
+    zend_class_entry *class_entry = resolve_type_class(type);
+    if (class_entry == NULL) {
+        return NULL;
+    }
+
+    bool nestable = is_nestable_class(class_entry);
+
+    return nestable ? class_entry : NULL;
+}
+
+static zend_class_entry *resolve_datetime_class(zend_type type, zend_class_entry *default_class)
+{
+    zend_class_entry *declared_class = resolve_type_class(type);
+    if (declared_class == NULL) {
+        return default_class;
+    }
+
+    bool is_instantiable = (declared_class->ce_flags & NOT_INSTANTIABLE_CLASS_FLAGS) == 0;
+    if (!is_instantiable) {
+        return default_class;
+    }
+
+    bool is_subclass = instanceof_function(declared_class, default_class);
+    if (!is_subclass) {
+        return default_class;
+    }
+
+    if (declared_class->create_object != default_class->create_object) {
+        return default_class;
+    }
+
+    return declared_class;
+}
+
+static bool is_integer_oid(Oid oid)
+{
+    switch (oid) {
+        case PG_OID_INT2:
+        case PG_OID_INT4:
+        case PG_OID_INT8:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool is_timestamp_oid(Oid oid)
+{
+    switch (oid) {
+        case PG_OID_TIMESTAMP:
+        case PG_OID_TIMESTAMPTZ:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool is_string_converted_oid(Oid oid)
+{
+    switch (oid) {
+        case PG_OID_INT2:
+        case PG_OID_INT4:
+        case PG_OID_INT8:
+        case PG_OID_FLOAT4:
+        case PG_OID_FLOAT8:
+        case PG_OID_BOOL:
+        case PG_OID_TIMESTAMP:
+        case PG_OID_TIMESTAMPTZ:
+            return false;
+        default:
+            return true;
+    }
+}
+
+static zend_class_entry *resolve_enum_class(zend_type type, Oid oid)
+{
+    zend_class_entry *declared_class = resolve_type_class(type);
+    if (declared_class == NULL) {
+        return NULL;
+    }
+
+    bool is_enum = (declared_class->ce_flags & ZEND_ACC_ENUM) != 0;
+    if (!is_enum) {
+        return NULL;
+    }
+
+    bool backing_matches = false;
+    if (declared_class->enum_backing_type == IS_LONG) {
+        backing_matches = is_integer_oid(oid);
+    }
+    if (declared_class->enum_backing_type == IS_STRING) {
+        backing_matches = is_string_converted_oid(oid);
+    }
+
+    return backing_matches ? declared_class : NULL;
+}
+
+static bool is_writable_property(const zend_property_info *property)
+{
+    if (property->flags & ZEND_ACC_STATIC) {
+        return false;
+    }
+
+    return property->hooks == NULL;
+}
+
+static zend_property_info *resolve_property(zend_class_entry *class_entry, zend_string *name)
+{
+    zend_property_info *property = zend_hash_find_ptr(&class_entry->properties_info, name);
+    if (property == NULL) {
+        return NULL;
+    }
+
+    bool writable = is_writable_property(property);
+
+    return writable ? property : NULL;
+}
+
+static zend_property_info *get_first_property(zend_class_entry *class_entry, zend_string **name)
+{
+    zend_string *property_name;
+    zend_property_info *property;
+
+    ZEND_HASH_FOREACH_STR_KEY_PTR(&class_entry->properties_info, property_name, property) {
+        bool writable = is_writable_property(property);
+        if (writable) {
+            *name = property_name;
+
+            return property;
+        }
+    } ZEND_HASH_FOREACH_END();
 
     return NULL;
 }
 
-/* Get the first declared non-static, non-hooked property of a class (any visibility). */
-static bool get_first_property(zend_class_entry *ce, zend_string **name_out,
-                               zend_property_info **prop_out)
+static bool accepts_instance_of(zend_type type, zend_class_entry *value_class)
 {
-    zend_string *pname;
-    zend_property_info *pinfo;
-    ZEND_HASH_FOREACH_STR_KEY_PTR(&ce->properties_info, pname, pinfo) {
-        if (pinfo->flags & ZEND_ACC_STATIC) continue;
-#if PHP_VERSION_ID >= 80400
-        if (pinfo->hooks) continue;
-#endif
-        *name_out = pname;
-        *prop_out = pinfo;
-        return true;
-    } ZEND_HASH_FOREACH_END();
-    return false;
+    zend_class_entry *declared_class = resolve_type_class(type);
+    if (declared_class == NULL) {
+        return false;
+    }
+
+    return instanceof_function(value_class, declared_class);
 }
 
-/* Resolve a non-static, non-hooked property on a class (any visibility —
- * slots are written directly; fallback writes use the declaring class scope). */
-static zend_property_info *resolve_property(zend_class_entry *ce, zend_string *name)
+static bool can_skip_type_check(zend_type type, Oid oid, zend_class_entry *datetime_class)
 {
-    zend_property_info *prop = zend_hash_find_ptr(&ce->properties_info, name);
-    if (!prop) return NULL;
-    if (prop->flags & ZEND_ACC_STATIC) return NULL;
-#if PHP_VERSION_ID >= 80400
-    if (prop->hooks) return NULL;
-#endif
-    return prop;
-}
-
-/* Check if the zval type produced by this OID is compatible with the declared property type.
- * Only covers non-null values; null acceptability is checked separately. */
-static bool can_skip_type_check(const zend_property_info *info, Oid oid, zend_class_entry *datetime_ce)
-{
-    if (!ZEND_TYPE_IS_SET(info->type)) {
+    if (!ZEND_TYPE_IS_SET(type)) {
         return true;
     }
 
-    uint32_t mask = ZEND_TYPE_FULL_MASK(info->type);
+    uint32_t mask = ZEND_TYPE_FULL_MASK(type);
 
     switch (oid) {
         case PG_OID_INT2:
@@ -180,66 +343,587 @@ static bool can_skip_type_check(const zend_property_info *info, Oid oid, zend_cl
             return (mask & MAY_BE_DOUBLE) != 0;
 
         case PG_OID_BOOL:
-            return (mask & (MAY_BE_TRUE | MAY_BE_FALSE)) == (MAY_BE_TRUE | MAY_BE_FALSE);
+            return (mask & MAY_BE_BOOL) == MAY_BE_BOOL;
 
         case PG_OID_TIMESTAMP:
         case PG_OID_TIMESTAMPTZ:
-            if (ZEND_TYPE_HAS_NAME(info->type)) {
-                zend_class_entry *type_ce = zend_lookup_class(ZEND_TYPE_NAME(info->type));
-                if (type_ce && instanceof_function(datetime_ce, type_ce)) {
-                    return true;
-                }
-            }
-            return false;
+            return accepts_instance_of(type, datetime_class);
 
         default:
             return (mask & MAY_BE_STRING) != 0;
     }
 }
 
-/* Check if a CE is a fast-path-compatible plain class. */
-static bool is_fast_path_class(zend_class_entry *ce)
+static bool type_accepts_null(zend_type type)
 {
-    return ce->__set == NULL && ce->create_object == NULL;
-}
-
-/* Check if a constructor only assigns its promoted properties and every
- * parameter has a mapped column. Running it would then only copy the column
- * values into the same slots, so it is skipped and the fast path writes them. */
-static bool can_skip_promoted_ctor(zend_function *ctor, zend_class_entry *ce,
-                                   const col_mapping *mappings, int ncols)
-{
-    if (ctor->type != ZEND_USER_FUNCTION) return false;
-    if (ctor->common.fn_flags & ZEND_ACC_VARIADIC) return false;
-
-    uint32_t num_args = ctor->common.num_args;
-    if (num_args == 0) return false;
-
-    for (uint32_t i = 0; i < num_args; i++) {
-        zend_arg_info *arg = &ctor->common.arg_info[i];
-        if (!ZEND_ARG_IS_PROMOTED(arg)) return false;
-
-        zend_property_info *prop = resolve_property(ce, arg->name);
-        if (!prop) return false;
-        if (prop->ce != ctor->common.scope) return false;
-
-        bool has_column = false;
-        for (int c = 0; c < ncols; c++) {
-            if (mappings[c].valid && mappings[c].props[0] == prop) {
-                has_column = true;
-                break;
-            }
-        }
-        if (!has_column) return false;
+    if (!ZEND_TYPE_IS_SET(type)) {
+        return true;
     }
 
-    /* Each promoted param compiles to one ASSIGN_OBJ + OP_DATA. Any other
-     * opcode, or an extra assignment in the body, means custom logic. */
+    return (ZEND_TYPE_FULL_MASK(type) & MAY_BE_NULL) != 0;
+}
+
+static slot_type_check build_slot_type_check(zend_type type, Oid oid, zend_class_entry *datetime_class)
+{
+    slot_type_check type_check;
+    type_check.skip_type_check = can_skip_type_check(type, oid, datetime_class);
+    type_check.accepts_null = type_accepts_null(type);
+
+    return type_check;
+}
+
+static zend_always_inline bool is_digit(char character)
+{
+    return character >= '0' && character <= '9';
+}
+
+static zend_always_inline zend_long parse_long(const char *digits)
+{
+    bool is_negative = digits[0] == '-';
+    const char *cursor = is_negative ? digits + 1 : digits;
+    zend_ulong magnitude = 0;
+
+    for (; *cursor != '\0'; cursor++) {
+        magnitude = magnitude * 10 + (zend_ulong)(*cursor - '0');
+    }
+
+    return (zend_long)(is_negative ? 0 - magnitude : magnitude);
+}
+
+static zend_always_inline double parse_float(const char *text)
+{
+    switch (text[0]) {
+        case 'N':
+            return ZEND_NAN;
+        case 'I':
+            return ZEND_INFINITY;
+        case '-':
+            if (text[1] == 'I') {
+                return -ZEND_INFINITY;
+            }
+            break;
+    }
+
+    return zend_strtod(text, NULL);
+}
+
+static zend_always_inline int parse_digits(const char *text, int width)
+{
+    int value = 0;
+
+    for (int index = 0; index < width; index++) {
+        bool digit = is_digit(text[index]);
+        if (!digit) {
+            return INVALID_DIGITS;
+        }
+        value = value * 10 + (text[index] - '0');
+    }
+
+    return value;
+}
+
+static bool parse_iso_date_time(const char *raw, int fields[ISO_FIELD_COUNT])
+{
+#pragma GCC unroll 8
+    for (int index = 0; index < ISO_SEPARATOR_COUNT; index++) {
+        const iso_separator *expected = &ISO_DATE_TIME_SEPARATORS[index];
+        if (raw[expected->position] != expected->separator) {
+            return false;
+        }
+    }
+
+#pragma GCC unroll 8
+    for (int index = 0; index < ISO_FIELD_COUNT; index++) {
+        const iso_field *field = &ISO_DATE_TIME_FIELDS[index];
+        int value = parse_digits(raw + field->position, field->width);
+        if (value == INVALID_DIGITS) {
+            return false;
+        }
+        if (value < field->minimum) {
+            return false;
+        }
+        if (value > field->maximum) {
+            return false;
+        }
+        fields[index] = value;
+    }
+
+    return true;
+}
+
+static const char *parse_fraction(const char *cursor, const char *end, int *microsecond)
+{
+    *microsecond = 0;
+    if (*cursor != '.') {
+        return cursor;
+    }
+
+    cursor++;
+
+    for (int scale = MICROSECOND_DIGITS_SCALE; scale > 0; scale /= 10) {
+        if (cursor == end) {
+            break;
+        }
+        bool digit = is_digit(*cursor);
+        if (!digit) {
+            break;
+        }
+        *microsecond += (*cursor - '0') * scale;
+        cursor++;
+    }
+
+    return cursor;
+}
+
+static const char *parse_utc_offset(const char *cursor, const char *end, int *utc_offset)
+{
+    if (cursor == end) {
+        return NULL;
+    }
+
+    int sign;
+    switch (*cursor) {
+        case '+':
+            sign = 1;
+            break;
+        case '-':
+            sign = -1;
+            break;
+        default:
+            return NULL;
+    }
+
+    cursor++;
+    int seconds = 0;
+
+    for (int part = 0; part < ISO_OFFSET_PART_COUNT; part++) {
+        ptrdiff_t remaining = end - cursor;
+        if (remaining < ISO_OFFSET_PART_WIDTH) {
+            return NULL;
+        }
+
+        int value = parse_digits(cursor, ISO_OFFSET_PART_WIDTH);
+        if (value == INVALID_DIGITS) {
+            return NULL;
+        }
+
+        seconds += value * ISO_OFFSET_PART_SECONDS[part];
+        cursor += ISO_OFFSET_PART_WIDTH;
+
+        if (cursor == end) {
+            break;
+        }
+        if (*cursor != ':') {
+            break;
+        }
+        cursor++;
+    }
+
+    *utc_offset = sign * seconds;
+
+    return cursor;
+}
+
+static bool apply_era_suffix(const char *cursor, const char *end, int *year)
+{
+    if (cursor == end) {
+        return true;
+    }
+
+    size_t remaining = end - cursor;
+    if (remaining != ISO_BC_SUFFIX_LENGTH) {
+        return false;
+    }
+
+    int compared = memcmp(cursor, ISO_BC_SUFFIX, ISO_BC_SUFFIX_LENGTH);
+    if (compared != 0) {
+        return false;
+    }
+
+    *year = 1 - *year;
+
+    return true;
+}
+
+static bool parse_iso_timestamptz(const char *raw, int length, iso_timestamp *timestamp)
+{
+    if (length < MIN_ISO_TIMESTAMPTZ_LENGTH) {
+        return false;
+    }
+
+    bool has_date_time = parse_iso_date_time(raw, timestamp->fields);
+    if (!has_date_time) {
+        return false;
+    }
+
+    const char *end = raw + length;
+    const char *cursor = parse_fraction(raw + ISO_FRACTION_POSITION, end, &timestamp->microsecond);
+    cursor = parse_utc_offset(cursor, end, &timestamp->utc_offset);
+    if (cursor == NULL) {
+        return false;
+    }
+
+    return apply_era_suffix(cursor, end, &timestamp->fields[FIELD_YEAR]);
+}
+
+static zend_long count_days_since_epoch(zend_long year, zend_long month, zend_long day)
+{
+    zend_long march_year = month <= 2 ? year - 1 : year;
+    zend_long era = (march_year >= 0 ? march_year : march_year - 399) / 400;
+    zend_long year_of_era = march_year - era * 400;
+    zend_long march_month = month > 2 ? month - 3 : month + 9;
+    zend_long day_of_year = (153 * march_month + 2) / 5 + day - 1;
+    zend_long day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+
+    return era * DAYS_PER_400_YEARS + day_of_era - DAYS_FROM_MARCH_YEAR_ZERO_TO_EPOCH;
+}
+
+static void initialize_offset_time(php_date_obj *date, const iso_timestamp *timestamp)
+{
+    const int *fields = timestamp->fields;
+    zend_long days = count_days_since_epoch(fields[FIELD_YEAR], fields[FIELD_MONTH], fields[FIELD_DAY]);
+    zend_long local_seconds = days * SECONDS_PER_DAY
+        + fields[FIELD_HOUR] * SECONDS_PER_HOUR
+        + fields[FIELD_MINUTE] * SECONDS_PER_MINUTE
+        + fields[FIELD_SECOND];
+
+    php_date_initialize_from_ts_long(date, local_seconds - timestamp->utc_offset, timestamp->microsecond);
+
+    timelib_time *time = date->time;
+    time->y = fields[FIELD_YEAR];
+    time->m = fields[FIELD_MONTH];
+    time->d = fields[FIELD_DAY];
+    time->h = fields[FIELD_HOUR];
+    time->i = fields[FIELD_MINUTE];
+    time->s = fields[FIELD_SECOND];
+    time->z = timestamp->utc_offset;
+    time->dst = 0;
+    time->have_zone = 1;
+    time->is_localtime = 1;
+}
+
+static void convert_pg_datetime(zval *value, const char *raw, int length, zend_class_entry *datetime_class)
+{
+    zval date_object;
+    php_date_instantiate(datetime_class, &date_object);
+    php_date_obj *date = Z_PHPDATE_P(&date_object);
+
+    iso_timestamp timestamp;
+    bool is_iso = parse_iso_timestamptz(raw, length, &timestamp);
+    if (is_iso) {
+        initialize_offset_time(date, &timestamp);
+        ZVAL_COPY_VALUE(value, &date_object);
+
+        return;
+    }
+
+    bool parsed = php_date_initialize(date, raw, length, NULL, NULL, 0);
+    if (!parsed) {
+        zval_ptr_dtor(&date_object);
+        ZVAL_NULL(value);
+
+        return;
+    }
+
+    ZVAL_COPY_VALUE(value, &date_object);
+}
+
+static bool convert_pg_enum(zval *value, const char *raw, int length, zend_class_entry *enum_class)
+{
+    zend_object *case_object = NULL;
+    zend_result lookup_status;
+
+    if (enum_class->enum_backing_type == IS_LONG) {
+        lookup_status = zend_enum_get_case_by_value(&case_object, enum_class, parse_long(raw), NULL, false);
+    } else {
+        zend_string *key = zend_string_init(raw, length, 0);
+        lookup_status = zend_enum_get_case_by_value(&case_object, enum_class, 0, key, false);
+        zend_string_release(key);
+    }
+
+    if (lookup_status == FAILURE) {
+        ZVAL_UNDEF(value);
+
+        return false;
+    }
+
+    ZVAL_OBJ_COPY(value, case_object);
+
+    return true;
+}
+
+static zend_always_inline void convert_pg_value(zval *value, const char *raw, int length,
+                                                Oid oid, zend_class_entry *datetime_class)
+{
+    switch (oid) {
+        case PG_OID_INT2:
+        case PG_OID_INT4:
+        case PG_OID_INT8:
+            ZVAL_LONG(value, parse_long(raw));
+            break;
+
+        case PG_OID_FLOAT4:
+        case PG_OID_FLOAT8:
+            ZVAL_DOUBLE(value, parse_float(raw));
+            break;
+
+        case PG_OID_BOOL:
+            ZVAL_BOOL(value, raw[0] == 't');
+            break;
+
+        case PG_OID_TIMESTAMP:
+        case PG_OID_TIMESTAMPTZ:
+            convert_pg_datetime(value, raw, length, datetime_class);
+            break;
+
+        default:
+            ZVAL_STRINGL(value, raw, length);
+            break;
+    }
+}
+
+static zend_always_inline void read_cell(zval *value, PGresult *result, int row, int column,
+                                         Oid oid, zend_class_entry *datetime_class)
+{
+    bool is_null = PQgetisnull(result, row, column);
+    if (is_null) {
+        ZVAL_NULL(value);
+
+        return;
+    }
+
+    const char *raw = PQgetvalue(result, row, column);
+    int length = PQgetlength(result, row, column);
+    convert_pg_value(value, raw, length, oid, datetime_class);
+}
+
+static zend_always_inline bool read_mapped_cell(zval *value, PGresult *result, const column_plan *column_info,
+                                                int row, int column)
+{
+    zend_class_entry *enum_class = column_info->mapping.enum_class;
+    if (enum_class == NULL) {
+        read_cell(value, result, row, column, column_info->oid, column_info->mapping.datetime_class);
+
+        return true;
+    }
+
+    bool is_null = PQgetisnull(result, row, column);
+    if (is_null) {
+        ZVAL_NULL(value);
+
+        return true;
+    }
+
+    const char *raw = PQgetvalue(result, row, column);
+    int length = PQgetlength(result, row, column);
+
+    return convert_pg_enum(value, raw, length, enum_class);
+}
+
+static zend_always_inline void write_property_value(zend_object *object, uint32_t offset, zend_property_info *property,
+                                                    zend_string *name, zval *value, slot_type_check type_check)
+{
+    bool is_null_value = Z_TYPE_P(value) == IS_NULL;
+    bool can_write_directly = is_null_value ? type_check.accepts_null : type_check.skip_type_check;
+    if (can_write_directly) {
+        zval *slot = OBJ_PROP(object, offset);
+        i_zval_ptr_dtor(slot);
+        ZVAL_COPY_VALUE(slot, value);
+
+        return;
+    }
+
+    zend_update_property_ex(property->ce, object, name, value);
+    zval_ptr_dtor(value);
+}
+
+static zend_object *get_or_create_nested_object(zend_object *owner, const column_mapping *mapping, int level)
+{
+    zval *slot = OBJ_PROP(owner, mapping->property_offsets[level]);
+    if (Z_TYPE_P(slot) == IS_OBJECT) {
+        return Z_OBJ_P(slot);
+    }
+
+    zval_ptr_dtor(slot);
+    zend_result created = object_init_ex(slot, mapping->owner_classes[level + 1]);
+    if (created != SUCCESS) {
+        return NULL;
+    }
+
+    return Z_OBJ_P(slot);
+}
+
+static zend_always_inline void write_mapped_value(zend_object *object, const column_mapping *mapping, zval *value)
+{
+    int leaf = mapping->depth - 1;
+
+    for (int level = 0; level < leaf; level++) {
+        object = get_or_create_nested_object(object, mapping, level);
+        if (object == NULL) {
+            zval_ptr_dtor(value);
+
+            return;
+        }
+    }
+
+    write_property_value(object, mapping->property_offsets[leaf], mapping->properties[leaf], mapping->names[leaf],
+                         value, mapping->type_check);
+}
+
+static bool resolve_property_path(column_mapping *mapping, const char *column_name, zend_class_entry *root_class)
+{
+    const char *segment = column_name;
+    zend_class_entry *owner_class = root_class;
+
+    for (int level = 0; level < MAX_NESTING_DEPTH; level++) {
+        const char *dot = strchr(segment, '.');
+        size_t length = dot == NULL ? strlen(segment) : (size_t)(dot - segment);
+        if (length == 0) {
+            return false;
+        }
+
+        zend_string *name = zend_string_init(segment, length, 0);
+        mapping->names[level] = name;
+        mapping->owner_classes[level] = owner_class;
+
+        zend_property_info *property = resolve_property(owner_class, name);
+        if (property == NULL) {
+            return false;
+        }
+        mapping->properties[level] = property;
+        mapping->property_offsets[level] = property->offset;
+
+        if (dot == NULL) {
+            mapping->depth = level + 1;
+
+            return true;
+        }
+
+        owner_class = resolve_nestable_class(property->type);
+        if (owner_class == NULL) {
+            return false;
+        }
+        segment = dot + 1;
+    }
+
+    return false;
+}
+
+static bool expand_single_value_object(column_mapping *mapping)
+{
+    zend_class_entry *value_class = resolve_nestable_class(mapping->properties[0]->type);
+    if (value_class == NULL) {
+        return true;
+    }
+
+    zend_string *first_name;
+    zend_property_info *first_property = get_first_property(value_class, &first_name);
+    if (first_property == NULL) {
+        return false;
+    }
+
+    mapping->depth = 2;
+    mapping->names[1] = zend_string_copy(first_name);
+    mapping->owner_classes[1] = value_class;
+    mapping->properties[1] = first_property;
+    mapping->property_offsets[1] = first_property->offset;
+
+    return true;
+}
+
+static void resolve_leaf_conversion(column_mapping *mapping, Oid oid)
+{
+    zend_property_info *leaf = mapping->properties[mapping->depth - 1];
+
+    bool is_timestamp = is_timestamp_oid(oid);
+    if (is_timestamp) {
+        mapping->datetime_class = resolve_datetime_class(leaf->type, mapping->datetime_class);
+    }
+
+    mapping->enum_class = resolve_enum_class(leaf->type, oid);
+    mapping->type_check = build_slot_type_check(leaf->type, oid, mapping->datetime_class);
+    if (mapping->enum_class != NULL) {
+        mapping->type_check.skip_type_check = true;
+    }
+}
+
+static void build_column_mapping(column_mapping *mapping, const char *column_name, zend_class_entry *root_class, Oid oid)
+{
+    bool resolved = resolve_property_path(mapping, column_name, root_class);
+    if (!resolved) {
+        return;
+    }
+
+    if (mapping->depth == 1) {
+        bool expanded = expand_single_value_object(mapping);
+        if (!expanded) {
+            return;
+        }
+    }
+
+    resolve_leaf_conversion(mapping, oid);
+    mapping->valid = true;
+}
+
+static void plan_columns(query_plan *plan)
+{
+    plan->columns = ecalloc(plan->column_count, sizeof(column_plan));
+
+    for (int column = 0; column < plan->column_count; column++) {
+        column_plan *column_info = &plan->columns[column];
+        const char *name = PQfname(plan->result, column);
+        column_info->oid = PQftype(plan->result, column);
+        column_info->mapping.datetime_class = plan->default_datetime_class;
+
+        if (plan->is_fast_path) {
+            build_column_mapping(&column_info->mapping, name, plan->target_class, column_info->oid);
+            continue;
+        }
+
+        column_info->name = zend_new_interned_string(zend_string_init(name, strlen(name), 0));
+    }
+}
+
+static bool has_mapped_column_for(const query_plan *plan, const zend_property_info *property)
+{
+    for (int column = 0; column < plan->column_count; column++) {
+        const column_mapping *mapping = &plan->columns[column].mapping;
+        if (!mapping->valid) {
+            continue;
+        }
+        if (mapping->properties[0] == property) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool is_promoted_param_with_column(const query_plan *plan, const zend_function *constructor,
+                                          const zend_arg_info *argument)
+{
+    if (!ZEND_ARG_IS_PROMOTED(argument)) {
+        return false;
+    }
+
+    zend_property_info *property = resolve_property(plan->target_class, argument->name);
+    if (property == NULL) {
+        return false;
+    }
+
+    if (property->ce != constructor->common.scope) {
+        return false;
+    }
+
+    return has_mapped_column_for(plan, property);
+}
+
+static bool has_only_promoted_assignments(const zend_op_array *op_array, uint32_t param_count)
+{
     uint32_t assignments = 0;
-    zend_op *opcodes = ctor->op_array.opcodes;
-    uint32_t last = ctor->op_array.last;
-    for (uint32_t i = 0; i < last; i++) {
-        switch (opcodes[i].opcode) {
+
+    for (uint32_t index = 0; index < op_array->last; index++) {
+        switch (op_array->opcodes[index].opcode) {
             case ZEND_ASSIGN_OBJ:
                 assignments++;
                 continue;
@@ -256,896 +940,585 @@ static bool can_skip_promoted_ctor(zend_function *ctor, zend_class_entry *ce,
         }
     }
 
-    return assignments == num_args;
+    return assignments == param_count;
 }
 
-/* Fast decimal integer parser — PG guarantees valid decimal digits.
- * Avoids strtoll overhead (base detection, errno, whitespace handling). */
-static zend_always_inline zend_long fast_parse_long(const char *s)
+static bool can_skip_promoted_constructor(const query_plan *plan, const zend_function *constructor)
 {
-    zend_ulong val = 0;
-    bool neg = false;
-    if (*s == '-') { neg = true; s++; }
-    while (*s >= '0' && *s <= '9') {
-        val = val * 10 + (zend_ulong)(*s - '0');
-        s++;
-    }
-    return (zend_long)(neg ? 0 - val : val);
-}
-
-/* Fixed-width decimal field for the ISO timestamp parser; -1 on a non-digit. */
-static zend_always_inline int parse_digits(const char *s, int width)
-{
-    int val = 0;
-    for (int i = 0; i < width; i++) {
-        if (s[i] < '0' || s[i] > '9') return -1;
-        val = val * 10 + (s[i] - '0');
-    }
-    return val;
-}
-
-/* Days since 1970-01-01 in the proleptic Gregorian calendar (H. Hinnant's days_from_civil). */
-static zend_always_inline zend_long days_from_civil(zend_long y, int m, int d)
-{
-    y -= m <= 2;
-    zend_long era = (y >= 0 ? y : y - 399) / 400;
-    zend_long yoe = y - era * 400;
-    zend_long doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
-    zend_long doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    return era * 146097 + doe - 719468;
-}
-
-/* Build a DateTime object from PostgreSQL's ISO timestamptz output
- * ("YYYY-MM-DD HH:MM:SS[.ffffff]+HH[:MM[:SS]][ BC]") without the generic
- * strtotime parser. The result equals DateTime('@epoch')->setTimezone('+HH:MM'):
- * the fields timelib_set_timezone_from_offset() and timelib_unixtime2local()
- * set for an offset zone. Returns false for any other shape (no offset,
- * non-ISO DateStyle, infinity) so the caller falls back to php_date_initialize. */
-static bool init_pg_iso_timestamptz(php_date_obj *dt, const char *raw, int len)
-{
-    if (len < 22) return false;
-    if (raw[4] != '-' || raw[7] != '-' || raw[10] != ' ' || raw[13] != ':' || raw[16] != ':') return false;
-
-    int year = parse_digits(raw, 4);
-    int month = parse_digits(raw + 5, 2);
-    int day = parse_digits(raw + 8, 2);
-    int hour = parse_digits(raw + 11, 2);
-    int minute = parse_digits(raw + 14, 2);
-    int second = parse_digits(raw + 17, 2);
-    if (year < 0 || month < 1 || month > 12 || day < 1 || day > 31) return false;
-    if (hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59) return false;
-
-    const char *p = raw + 19;
-    const char *end = raw + len;
-
-    int microseconds = 0;
-    if (*p == '.') {
-        p++;
-        int scale = 100000;
-        while (p < end && *p >= '0' && *p <= '9' && scale > 0) {
-            microseconds += (*p - '0') * scale;
-            scale /= 10;
-            p++;
-        }
-    }
-
-    if (p >= end || (*p != '+' && *p != '-')) return false;
-    int sign = *p == '-' ? -1 : 1;
-    p++;
-
-    int offset_parts[3] = {0, 0, 0};
-    for (int part = 0; part < 3; part++) {
-        if (end - p < 2) return false;
-        offset_parts[part] = parse_digits(p, 2);
-        if (offset_parts[part] < 0) return false;
-        p += 2;
-        if (p >= end || *p != ':') break;
-        p++;
-    }
-    int offset = sign * (offset_parts[0] * 3600 + offset_parts[1] * 60 + offset_parts[2]);
-
-    zend_long local_year = year;
-    if (p < end) {
-        if (end - p != 3 || memcmp(p, " BC", 3) != 0) return false;
-        local_year = 1 - year;
-    }
-
-    zend_long local_seconds = days_from_civil(local_year, month, day) * 86400
-        + hour * 3600 + minute * 60 + second;
-
-    php_date_initialize_from_ts_long(dt, local_seconds - offset, microseconds);
-
-    timelib_time *time = dt->time;
-    time->y = local_year;
-    time->m = month;
-    time->d = day;
-    time->h = hour;
-    time->i = minute;
-    time->s = second;
-    time->z = offset;
-    time->dst = 0;
-    time->have_zone = 1;
-    time->is_localtime = 1;
-
-    return true;
-}
-
-/* PostgreSQL prints the special float values as "NaN", "Infinity", "-Infinity",
- * which zend_strtod does not parse. */
-static zend_always_inline double parse_pg_float(const char *s)
-{
-    if (s[0] == 'N') return ZEND_NAN;
-    if (s[0] == 'I') return ZEND_INFINITY;
-    if (s[0] == '-' && s[1] == 'I') return -ZEND_INFINITY;
-    return zend_strtod(s, NULL);
-}
-
-/* DateTime conversion — kept out-of-line (cold path). */
-static void convert_pg_datetime(zval *val, const char *raw, int len,
-                                zend_class_entry *datetime_ce)
-{
-    zval dt_obj;
-    php_date_instantiate(datetime_ce, &dt_obj);
-    php_date_obj *dt = Z_PHPDATE_P(&dt_obj);
-    if (init_pg_iso_timestamptz(dt, raw, len)) {
-        ZVAL_COPY_VALUE(val, &dt_obj);
-        return;
-    }
-    if (!php_date_initialize(dt, raw, len, NULL, NULL, 0)) {
-        zval_ptr_dtor(&dt_obj);
-        ZVAL_NULL(val);
-    } else {
-        ZVAL_COPY_VALUE(val, &dt_obj);
-    }
-}
-
-/* Resolve a backed-enum case from a non-NULL PG value — from() semantics
- * (throws ValueError on an unknown value). Returns false with an exception
- * pending on failure; otherwise stores the (incref'd) case singleton. */
-static bool convert_pg_enum(zval *val, const char *raw, int len,
-                            zend_class_entry *enum_ce)
-{
-    zend_object *case_obj = NULL;
-    zend_result status;
-
-    if (enum_ce->enum_backing_type == IS_LONG) {
-        status = zend_enum_get_case_by_value(&case_obj, enum_ce, fast_parse_long(raw), NULL, false);
-    } else {
-        zend_string *key = zend_string_init(raw, len, 0);
-        status = zend_enum_get_case_by_value(&case_obj, enum_ce, 0, key, false);
-        zend_string_release(key);
-    }
-
-    if (status == FAILURE) {
-        ZVAL_UNDEF(val);
+    if (constructor->type != ZEND_USER_FUNCTION) {
         return false;
     }
 
-    ZVAL_OBJ_COPY(val, case_obj);
+    if (constructor->common.fn_flags & ZEND_ACC_VARIADIC) {
+        return false;
+    }
+
+    uint32_t param_count = constructor->common.num_args;
+    if (param_count == 0) {
+        return false;
+    }
+
+    for (uint32_t index = 0; index < param_count; index++) {
+        bool skippable = is_promoted_param_with_column(plan, constructor, &constructor->common.arg_info[index]);
+        if (!skippable) {
+            return false;
+        }
+    }
+
+    return has_only_promoted_assignments(&constructor->op_array, param_count);
+}
+
+static void initialize_nested_column(nested_column *nested, const query_plan *plan, int column,
+                                     zend_property_info *property, zend_string *name)
+{
+    Oid oid = plan->columns[column].oid;
+
+    nested->column = column;
+    nested->property = property;
+    nested->name = name;
+    nested->type_check = build_slot_type_check(property->type, oid, plan->default_datetime_class);
+}
+
+static int find_unconsumed_column(const query_plan *plan, zend_string *name)
+{
+    for (int column = 0; column < plan->column_count; column++) {
+        if (plan->columns[column].is_constructor_argument) {
+            continue;
+        }
+
+        const char *column_name = PQfname(plan->result, column);
+        bool matches = zend_string_equals_cstr(name, column_name, strlen(column_name));
+        if (matches) {
+            return column;
+        }
+    }
+
+    return NOT_MAPPED;
+}
+
+static void match_direct_column(query_plan *plan, constructor_param *param, const zend_arg_info *argument)
+{
+    int column = find_unconsumed_column(plan, argument->name);
+    if (column == NOT_MAPPED) {
+        return;
+    }
+
+    param->column = column;
+    plan->columns[column].is_constructor_argument = true;
+
+    zend_class_entry *nested_class = resolve_nestable_class(argument->type);
+    if (nested_class == NULL) {
+        return;
+    }
+
+    zend_string *first_name;
+    zend_property_info *first_property = get_first_property(nested_class, &first_name);
+    if (first_property == NULL) {
+        return;
+    }
+
+    nested_column *nested = emalloc(sizeof(nested_column));
+    initialize_nested_column(nested, plan, column, first_property, zend_string_copy(first_name));
+
+    param->nested_class = nested_class;
+    param->nested_columns = nested;
+    param->nested_column_count = 1;
+}
+
+static const char *get_dot_path_rest(const char *column_name, const zend_string *prefix)
+{
+    size_t prefix_length = ZSTR_LEN(prefix);
+
+    int compared = strncmp(column_name, ZSTR_VAL(prefix), prefix_length);
+    if (compared != 0) {
+        return NULL;
+    }
+
+    if (column_name[prefix_length] != '.') {
+        return NULL;
+    }
+
+    const char *rest = column_name + prefix_length + 1;
+    if (*rest == '\0') {
+        return NULL;
+    }
+
+    return rest;
+}
+
+static void collect_dot_columns(query_plan *plan, constructor_param *param, const zend_arg_info *argument,
+                                zend_class_entry *nested_class)
+{
+    nested_column *found = safe_emalloc(plan->column_count, sizeof(nested_column), 0);
+    uint32_t count = 0;
+
+    for (int column = 0; column < plan->column_count; column++) {
+        column_plan *column_info = &plan->columns[column];
+        if (column_info->is_constructor_argument) {
+            continue;
+        }
+
+        const char *rest = get_dot_path_rest(PQfname(plan->result, column), argument->name);
+        if (rest == NULL) {
+            continue;
+        }
+
+        zend_string *name = zend_string_init(rest, strlen(rest), 0);
+        zend_property_info *property = resolve_property(nested_class, name);
+        if (property == NULL) {
+            zend_string_release(name);
+            continue;
+        }
+
+        initialize_nested_column(&found[count], plan, column, property, name);
+        column_info->is_constructor_argument = true;
+        count++;
+    }
+
+    if (count == 0) {
+        efree(found);
+
+        return;
+    }
+
+    param->nested_class = nested_class;
+    param->nested_columns = found;
+    param->nested_column_count = count;
+}
+
+static void match_constructor_params(query_plan *plan)
+{
+    const zend_arg_info *arguments = plan->constructor->common.arg_info;
+
+    for (uint32_t index = 0; index < plan->constructor_param_count; index++) {
+        plan->constructor_params[index].column = NOT_MAPPED;
+        match_direct_column(plan, &plan->constructor_params[index], &arguments[index]);
+    }
+
+    for (uint32_t index = 0; index < plan->constructor_param_count; index++) {
+        constructor_param *param = &plan->constructor_params[index];
+        if (param->column != NOT_MAPPED) {
+            continue;
+        }
+
+        zend_class_entry *nested_class = resolve_nestable_class(arguments[index].type);
+        if (nested_class == NULL) {
+            continue;
+        }
+
+        collect_dot_columns(plan, param, &arguments[index], nested_class);
+    }
+}
+
+static bool is_param_mapped(const constructor_param *param)
+{
+    if (param->column != NOT_MAPPED) {
+        return true;
+    }
+
+    return param->nested_class != NULL;
+}
+
+static uint32_t count_leading_mapped_params(const query_plan *plan)
+{
+    uint32_t count = 0;
+
+    while (count < plan->constructor_param_count) {
+        bool mapped = is_param_mapped(&plan->constructor_params[count]);
+        if (!mapped) {
+            break;
+        }
+        count++;
+    }
+
+    return count;
+}
+
+static bool has_mapped_param_from(const query_plan *plan, uint32_t start)
+{
+    for (uint32_t index = start; index < plan->constructor_param_count; index++) {
+        bool mapped = is_param_mapped(&plan->constructor_params[index]);
+        if (mapped) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void plan_constructor_arguments(query_plan *plan)
+{
+    uint32_t leading_count = count_leading_mapped_params(plan);
+    plan->use_named_arguments = has_mapped_param_from(plan, leading_count);
+
+    if (plan->use_named_arguments) {
+        plan->argument_count = plan->constructor_param_count;
+        zend_hash_init(&plan->named_arguments, plan->constructor_param_count, NULL, ZVAL_PTR_DTOR, 0);
+
+        return;
+    }
+
+    plan->argument_count = leading_count;
+    plan->positional_arguments = safe_emalloc(leading_count, sizeof(zval), 0);
+}
+
+static void plan_constructor_params(query_plan *plan)
+{
+    if (plan->constructor->type != ZEND_USER_FUNCTION) {
+        return;
+    }
+
+    plan->constructor_param_count = plan->constructor->common.num_args;
+    if (plan->constructor_param_count == 0) {
+        return;
+    }
+
+    plan->constructor_params = ecalloc(plan->constructor_param_count, sizeof(constructor_param));
+    match_constructor_params(plan);
+    plan_constructor_arguments(plan);
+}
+
+static void prepare_constructor_call(query_plan *plan)
+{
+    zend_fcall_info *call = &plan->constructor_call;
+    call->size = sizeof(zend_fcall_info);
+    ZVAL_UNDEF(&call->function_name);
+    call->retval = &plan->constructor_return;
+    call->param_count = plan->use_named_arguments ? 0 : plan->argument_count;
+    call->params = plan->positional_arguments;
+    call->named_params = plan->use_named_arguments ? &plan->named_arguments : NULL;
+
+    zend_fcall_info_cache *cache = &plan->constructor_call_cache;
+    cache->function_handler = plan->constructor;
+    cache->called_scope = plan->target_class;
+    cache->closure = NULL;
+}
+
+static void plan_constructor(query_plan *plan)
+{
+    zend_function *constructor = plan->target_class->constructor;
+    if (constructor == NULL) {
+        return;
+    }
+
+    if (plan->is_fast_path) {
+        bool skippable = can_skip_promoted_constructor(plan, constructor);
+        if (skippable) {
+            return;
+        }
+    }
+
+    plan->constructor = constructor;
+    plan_constructor_params(plan);
+    prepare_constructor_call(plan);
+}
+
+static bool should_skip_property_write(const query_plan *plan, const column_plan *column_info)
+{
+    if (column_info->is_constructor_argument) {
+        return true;
+    }
+
+    if (!plan->is_fast_path) {
+        return false;
+    }
+
+    return !column_info->mapping.valid;
+}
+
+static void plan_property_writes(query_plan *plan)
+{
+    plan->all_columns_skipped = true;
+
+    for (int column = 0; column < plan->column_count; column++) {
+        column_plan *column_info = &plan->columns[column];
+        column_info->skip_property_write = should_skip_property_write(plan, column_info);
+        if (!column_info->skip_property_write) {
+            plan->all_columns_skipped = false;
+        }
+    }
+}
+
+static void build_query_plan(query_plan *plan, PGresult *result, zend_class_entry *target_class)
+{
+    memset(plan, 0, sizeof(*plan));
+    plan->result = result;
+    plan->target_class = target_class;
+    plan->default_datetime_class = php_date_get_immutable_ce();
+    plan->is_fast_path = is_fast_path_class(target_class);
+    plan->column_count = PQnfields(result);
+
+    plan_columns(plan);
+    plan_constructor(plan);
+    plan_property_writes(plan);
+}
+
+static void free_column_plan(column_plan *column_info)
+{
+    for (int level = 0; level < MAX_NESTING_DEPTH; level++) {
+        zend_string *name = column_info->mapping.names[level];
+        if (name != NULL) {
+            zend_string_release(name);
+        }
+    }
+
+    if (column_info->name != NULL) {
+        zend_string_release(column_info->name);
+    }
+}
+
+static void free_constructor_param(constructor_param *param)
+{
+    for (uint32_t index = 0; index < param->nested_column_count; index++) {
+        zend_string_release(param->nested_columns[index].name);
+    }
+
+    if (param->nested_columns != NULL) {
+        efree(param->nested_columns);
+    }
+}
+
+static void free_query_plan(query_plan *plan)
+{
+    for (int column = 0; column < plan->column_count; column++) {
+        free_column_plan(&plan->columns[column]);
+    }
+    efree(plan->columns);
+
+    if (plan->constructor_params != NULL) {
+        for (uint32_t index = 0; index < plan->constructor_param_count; index++) {
+            free_constructor_param(&plan->constructor_params[index]);
+        }
+        efree(plan->constructor_params);
+    }
+
+    if (plan->positional_arguments != NULL) {
+        efree(plan->positional_arguments);
+    }
+
+    if (plan->use_named_arguments) {
+        zend_hash_destroy(&plan->named_arguments);
+    }
+}
+
+static void fill_nested_object(zend_object *object, const query_plan *plan, const constructor_param *param, int row)
+{
+    for (uint32_t index = 0; index < param->nested_column_count; index++) {
+        const nested_column *nested = &param->nested_columns[index];
+        zval value;
+        read_cell(&value, plan->result, row, nested->column, plan->columns[nested->column].oid,
+                  plan->default_datetime_class);
+        write_property_value(object, nested->property->offset, nested->property, nested->name, &value,
+                             nested->type_check);
+    }
+}
+
+static zend_always_inline void build_constructor_argument(zval *argument, const query_plan *plan, const constructor_param *param, int row)
+{
+    if (param->nested_class == NULL) {
+        read_cell(argument, plan->result, row, param->column, plan->columns[param->column].oid,
+                  plan->default_datetime_class);
+
+        return;
+    }
+
+    if (param->column != NOT_MAPPED) {
+        bool is_null = PQgetisnull(plan->result, row, param->column);
+        if (is_null) {
+            ZVAL_NULL(argument);
+
+            return;
+        }
+    }
+
+    zend_result created = object_init_ex(argument, param->nested_class);
+    if (created != SUCCESS) {
+        ZVAL_NULL(argument);
+
+        return;
+    }
+
+    fill_nested_object(Z_OBJ_P(argument), plan, param, row);
+}
+
+static void invoke_constructor(zend_object *object, query_plan *plan)
+{
+    plan->constructor_call.object = object;
+    plan->constructor_call_cache.object = object;
+    zend_call_function(&plan->constructor_call, &plan->constructor_call_cache);
+    zval_ptr_dtor(&plan->constructor_return);
+}
+
+static void call_constructor_with_named_arguments(zend_object *object, query_plan *plan, int row)
+{
+    zend_hash_clean(&plan->named_arguments);
+
+    for (uint32_t index = 0; index < plan->argument_count; index++) {
+        const constructor_param *param = &plan->constructor_params[index];
+        bool mapped = is_param_mapped(param);
+        if (!mapped) {
+            continue;
+        }
+
+        zval argument;
+        build_constructor_argument(&argument, plan, param, row);
+        zend_hash_add_new(&plan->named_arguments, plan->constructor->common.arg_info[index].name, &argument);
+    }
+
+    invoke_constructor(object, plan);
+}
+
+static void call_constructor(zend_object *object, query_plan *plan, int row)
+{
+    if (plan->use_named_arguments) {
+        call_constructor_with_named_arguments(object, plan, row);
+
+        return;
+    }
+
+    for (uint32_t index = 0; index < plan->argument_count; index++) {
+        build_constructor_argument(&plan->positional_arguments[index], plan, &plan->constructor_params[index], row);
+    }
+
+    invoke_constructor(object, plan);
+
+    for (uint32_t index = 0; index < plan->argument_count; index++) {
+        zval_ptr_dtor(&plan->positional_arguments[index]);
+    }
+}
+
+static void write_columns(zend_object *object, const query_plan *plan, int row)
+{
+    PGresult *result = plan->result;
+    const column_plan *columns = plan->columns;
+    int column_count = plan->column_count;
+    bool is_fast_path = plan->is_fast_path;
+
+    for (int column = 0; column < column_count; column++) {
+        const column_plan *column_info = &columns[column];
+        if (column_info->skip_property_write) {
+            continue;
+        }
+
+        zval value;
+        bool converted = read_mapped_cell(&value, result, column_info, row, column);
+        if (!converted) {
+            return;
+        }
+
+        if (is_fast_path) {
+            write_mapped_value(object, &column_info->mapping, &value);
+            continue;
+        }
+
+        zend_update_property_ex(plan->target_class, object, column_info->name, &value);
+        zval_ptr_dtor(&value);
+    }
+}
+
+static bool discard_if_failed(zval *row_object)
+{
+    if (EG(exception) == NULL) {
+        return false;
+    }
+
+    zval_ptr_dtor(row_object);
+
     return true;
 }
 
-/* Convert a non-NULL PG value to a zval based on column OID.
- * Fast cases are force-inlined; datetime stays out-of-line. */
-static zend_always_inline void convert_pg_value(zval *val, const char *raw, int len,
-                                                 Oid oid, zend_class_entry *datetime_ce)
+static bool hydrate_row(zval *row_object, query_plan *plan, int row)
 {
-    switch (oid) {
-        case PG_OID_INT2:
-        case PG_OID_INT4:
-        case PG_OID_INT8:
-            ZVAL_LONG(val, fast_parse_long(raw));
-            break;
-
-        case PG_OID_FLOAT4:
-        case PG_OID_FLOAT8:
-            ZVAL_DOUBLE(val, parse_pg_float(raw));
-            break;
-
-        case PG_OID_BOOL:
-            ZVAL_BOOL(val, raw[0] == 't' || raw[0] == 'T');
-            break;
-
-        case PG_OID_TIMESTAMP:
-        case PG_OID_TIMESTAMPTZ:
-            convert_pg_datetime(val, raw, len, datetime_ce);
-            break;
-
-        default:
-            ZVAL_STRINGL(val, raw, len);
-            break;
-    }
-}
-
-/* Fill a constructor param's nested object from its dot-columns ("nested.x").
- * Values whose type doesn't fit the slot are dropped. */
-static void fill_ctor_nest_object(zend_object *obj, const ctor_nest_info *nest, PGresult *res,
-                                  int row, const Oid *col_oids, zend_class_entry *datetime_ce)
-{
-    for (uint32_t j = 0; j < nest->count; j++) {
-        const ctor_nest_prop *prop = &nest->props[j];
-        int c = prop->col_idx;
-        zval val;
-
-        if (PQgetisnull(res, row, c)) {
-            ZVAL_NULL(&val);
-        } else {
-            convert_pg_value(&val, PQgetvalue(res, row, c),
-                             PQgetlength(res, row, c), col_oids[c], datetime_ce);
-        }
-
-        if (Z_TYPE(val) == IS_NULL ? prop->accepts_null : prop->skip_type_check) {
-            zval *slot = OBJ_PROP(obj, prop->prop_offset);
-            zval_ptr_dtor(slot);
-            ZVAL_COPY_VALUE(slot, &val);
-        } else {
-            zval_ptr_dtor(&val);
-        }
-    }
-}
-
-/* ----------------------------------------------------------------
- * Column mapping builder
- *
- * Splits column name by '.' to build a property path.
- * For flat columns (no dot) whose property type is a non-DateTime class,
- * auto-expands to depth 2: creates nested object, sets first property.
- * ---------------------------------------------------------------- */
-static void build_col_mapping(col_mapping *m, const char *col_name, size_t col_len,
-                              zend_class_entry *root_ce, Oid oid, zend_class_entry *datetime_ce)
-{
-    memset(m, 0, sizeof(*m));
-
-    /* Split by '.' */
-    const char *segments[MAX_NESTING_DEPTH];
-    size_t seg_lens[MAX_NESTING_DEPTH];
-    int nseg = 0;
-
-    const char *p = col_name;
-    const char *end = col_name + col_len;
-    while (p < end && nseg < MAX_NESTING_DEPTH) {
-        const char *dot = memchr(p, '.', end - p);
-        if (!dot) dot = end;
-        if (dot == p) return; /* empty segment */
-        segments[nseg] = p;
-        seg_lens[nseg] = dot - p;
-        nseg++;
-        p = dot + 1;
+    zend_result created = object_init_ex(row_object, plan->target_class);
+    if (created != SUCCESS) {
+        return false;
     }
 
-    if (nseg == 0 || nseg > MAX_NESTING_DEPTH) return;
-
-    /* Resolve property chain */
-    zend_class_entry *current_ce = root_ce;
-
-    for (int i = 0; i < nseg; i++) {
-        m->names[i] = zend_string_init(segments[i], seg_lens[i], 0);
-        m->ces[i] = current_ce;
-
-        zend_property_info *prop = resolve_property(current_ce, m->names[i]);
-        if (!prop) return;
-
-        m->props[i] = prop;
-        m->offsets[i] = prop->offset;
-
-        if (i < nseg - 1) {
-            /* Intermediate segment: resolve nested CE from property type */
-            zend_class_entry *child_ce = resolve_property_class(prop);
-            if (!child_ce || !is_fast_path_class(child_ce)) return;
-            current_ce = child_ce;
+    if (plan->constructor != NULL) {
+        call_constructor(Z_OBJ_P(row_object), plan, row);
+        bool constructor_failed = discard_if_failed(row_object);
+        if (constructor_failed) {
+            return false;
         }
     }
 
-    m->depth = nseg;
-
-    /* Auto-nest: flat column (no dot) where property is a non-DateTime class.
-     * Expand to depth 2: value goes to the first property of the nested class.
-     * Enums are excluded — they cannot be instantiated and are mapped by value. */
-    if (nseg == 1) {
-        zend_class_entry *prop_ce = resolve_property_class(m->props[0]);
-        if (prop_ce
-            && !instanceof_function(prop_ce, php_date_get_interface_ce())
-            && !(prop_ce->ce_flags & ZEND_ACC_ENUM)
-            && is_fast_path_class(prop_ce)) {
-            zend_string *first_name = NULL;
-            zend_property_info *first_prop = NULL;
-            if (!get_first_property(prop_ce, &first_name, &first_prop)) return;
-
-            m->depth = 2;
-            m->names[1] = zend_string_copy(first_name);
-            m->ces[1] = prop_ce;
-            m->props[1] = first_prop;
-            m->offsets[1] = first_prop->offset;
-        }
+    if (!plan->all_columns_skipped) {
+        write_columns(Z_OBJ_P(row_object), plan, row);
     }
 
-    /* Leaf type check info */
-    int leaf = m->depth - 1;
-    if (oid == PG_OID_TIMESTAMP || oid == PG_OID_TIMESTAMPTZ) {
-        m->datetime_ce = resolve_datetime_ce(m->props[leaf], datetime_ce);
-    } else {
-        m->datetime_ce = datetime_ce;
-    }
-    m->skip_type_check = can_skip_type_check(m->props[leaf], oid, m->datetime_ce);
-    m->accepts_null = !ZEND_TYPE_IS_SET(m->props[leaf]->type) ||
-                      (ZEND_TYPE_FULL_MASK(m->props[leaf]->type) & MAY_BE_NULL);
+    bool write_failed = discard_if_failed(row_object);
 
-    m->enum_ce = resolve_enum_ce(m->props[leaf], oid);
-    if (m->enum_ce) {
-        m->skip_type_check = true;
-    }
-
-    m->valid = true;
+    return !write_failed;
 }
 
-static void free_col_mapping(col_mapping *m)
-{
-    for (int i = 0; i < MAX_NESTING_DEPTH; i++) {
-        if (m->names[i]) zend_string_release(m->names[i]);
-    }
-}
-
-/* ----------------------------------------------------------------
- * Cached PgSql\Result class entry — resolved lazily at first call
- * ---------------------------------------------------------------- */
-static zend_class_entry *pgsql_result_ce = NULL;
-
-static zend_class_entry *resolve_pgsql_result_ce(void)
-{
-    if (pgsql_result_ce) {
-        return pgsql_result_ce;
-    }
-    zend_string *cn = zend_string_init("PgSql\\Result", sizeof("PgSql\\Result") - 1, 0);
-    pgsql_result_ce = zend_lookup_class(cn);
-    zend_string_release(cn);
-    return pgsql_result_ce;
-}
-
-/* {{{ pg_fast_query(PgSql\Result $result, string $class): array */
 PHP_FUNCTION(pg_fast_query)
 {
-    zval *zresult;
-    zend_string *class_name;
+    zval *result_object;
+    zend_class_entry *target_class = NULL;
 
     ZEND_PARSE_PARAMETERS_START(2, 2)
-        Z_PARAM_OBJECT(zresult)
-        Z_PARAM_STR(class_name)
+        Z_PARAM_OBJECT_OF_CLASS(result_object, pgsql_result_class)
+        Z_PARAM_CLASS(target_class)
     ZEND_PARSE_PARAMETERS_END();
 
-    /* Resolve PgSql\Result CE (lazy, cached) */
-    zend_class_entry *result_ce = resolve_pgsql_result_ce();
-    if (!result_ce) {
-        zend_throw_exception(zend_ce_error,
-            "pg_fast_query(): PgSql\\Result class not found — is ext/pgsql loaded?", 0);
+    PGresult *result = pgsql_result_from_obj(Z_OBJ_P(result_object))->result;
+    if (result == NULL) {
+        zend_throw_error(NULL, "pg_fast_query(): result handle is invalid");
         RETURN_THROWS();
     }
 
-    if (!instanceof_function(Z_OBJCE_P(zresult), result_ce)) {
-        zend_throw_exception(zend_ce_type_error,
-            "pg_fast_query(): argument #1 must be of type PgSql\\Result", 0);
-        RETURN_THROWS();
-    }
-
-    /* Look up target class */
-    zend_class_entry *ce = zend_lookup_class(class_name);
-    if (!ce) {
-        zend_throw_exception_ex(zend_ce_value_error, 0,
-            "pg_fast_query(): class \"%s\" not found", ZSTR_VAL(class_name));
-        RETURN_THROWS();
-    }
-
-    /* Extract PGresult* from PgSql\Result object (not owned by us — do NOT PQclear) */
-    pgsql_result_handle *rh = pgsql_result_from_obj(Z_OBJ_P(zresult));
-    PGresult *res = rh->result;
-
-    if (!res) {
-        zend_throw_exception(zend_ce_error,
-            "pg_fast_query(): result handle is invalid", 0);
-        RETURN_THROWS();
-    }
-
-    ExecStatusType status = PQresultStatus(res);
+    ExecStatusType status = PQresultStatus(result);
     if (status != PGRES_TUPLES_OK) {
         zend_throw_exception_ex(zend_ce_exception, 0,
-            "pg_fast_query(): result does not contain rows (status: %s)",
-            PQresStatus(status));
+            "pg_fast_query(): result does not contain rows (status: %s)", PQresStatus(status));
         RETURN_THROWS();
     }
 
-    int nrows = PQntuples(res);
-    int ncols = PQnfields(res);
+    query_plan plan;
+    build_query_plan(&plan, result, target_class);
 
-    /* Pre-fetch column OIDs */
-    Oid *col_oids = safe_emalloc(ncols, sizeof(Oid), 0);
-    for (int c = 0; c < ncols; c++) {
-        col_oids[c] = PQftype(res, c);
+    int row_count = PQntuples(result);
+    array_init_size(return_value, row_count);
+
+    for (int row = 0; row < row_count; row++) {
+        zval row_object;
+        bool hydrated = hydrate_row(&row_object, &plan, row);
+        if (!hydrated) {
+            break;
+        }
+        add_next_index_zval(return_value, &row_object);
     }
 
-    /* DateTimeImmutable class entry */
-    zend_class_entry *datetime_ce = php_date_get_immutable_ce();
+    free_query_plan(&plan);
 
-    /* Build column mappings (fast path) or intern column names (slow path) */
-    bool class_fast_path = is_fast_path_class(ce);
-    col_mapping *mappings = NULL;
-    zend_string **col_names = NULL;
-
-    if (class_fast_path) {
-        mappings = safe_emalloc(ncols, sizeof(col_mapping), 0);
-        for (int c = 0; c < ncols; c++) {
-            const char *fname = PQfname(res, c);
-            build_col_mapping(&mappings[c], fname, strlen(fname), ce, col_oids[c], datetime_ce);
-        }
-    } else {
-        col_names = safe_emalloc(ncols, sizeof(zend_string *), 0);
-        for (int c = 0; c < ncols; c++) {
-            const char *fname = PQfname(res, c);
-            col_names[c] = zend_new_interned_string(
-                zend_string_init(fname, strlen(fname), 0)
-            );
-        }
-    }
-
-    /* Per-column datetime instantiation class, hoisted out of the row loop.
-     * Fast-path columns carry the type-directed class (Carbon\CarbonImmutable etc.);
-     * everything else falls back to DateTimeImmutable. */
-    zend_class_entry **col_datetime_ces = safe_emalloc(ncols, sizeof(zend_class_entry *), 0);
-    zend_class_entry **col_enum_ces = safe_emalloc(ncols, sizeof(zend_class_entry *), 0);
-    for (int c = 0; c < ncols; c++) {
-        col_datetime_ces[c] = (class_fast_path && mappings[c].valid && mappings[c].datetime_ce)
-            ? mappings[c].datetime_ce
-            : datetime_ce;
-        col_enum_ces[c] = (class_fast_path && mappings[c].valid)
-            ? mappings[c].enum_ce
-            : NULL;
-    }
-
-    /* ---- Constructor analysis ---- */
-    bool has_ctor = (ce->constructor != NULL);
-    uint32_t ctor_num_params = has_ctor ? ce->constructor->common.num_args : 0;
-    uint32_t ctor_all_params = ctor_num_params; /* original count for cleanup */
-    int *ctor_param_col = NULL;              /* [param] -> col index, or -1 */
-    bool *col_is_ctor_arg = NULL;            /* [col]   -> true if consumed by ctor */
-    zend_class_entry **ctor_param_nest_ce = NULL;   /* [param] -> CE for auto-nest or NULL */
-    uint32_t *ctor_param_nest_offset = NULL;        /* [param] -> first-prop offset */
-    ctor_nest_info **ctor_param_dot = NULL;         /* [param] -> dot-col nesting or NULL */
-    zval *ctor_args = NULL;                         /* positional args array */
-    uint32_t ctor_positional_count = 0;             /* number of positional args to pass */
-    bool ctor_use_positional = false;               /* true = no gaps, use positional */
-    bool ctor_all_cols = false;                     /* true = all columns consumed by ctor */
-    bool ctor_ht_inited = false;
-    HashTable ctor_named_ht;
-
-    if (has_ctor && class_fast_path &&
-        can_skip_promoted_ctor(ce->constructor, ce, mappings, ncols)) {
-        has_ctor = false;
-        ctor_num_params = 0;
-    }
-
-    if (has_ctor && ctor_num_params > 0) {
-        zend_function *ctor = ce->constructor;
-        zend_arg_info *arg_info = ctor->common.arg_info;
-
-        ctor_param_col = safe_emalloc(ctor_num_params, sizeof(int), 0);
-        col_is_ctor_arg = ecalloc(ncols, sizeof(bool));
-        ctor_param_nest_ce = ecalloc(ctor_num_params, sizeof(zend_class_entry *));
-        ctor_param_nest_offset = safe_emalloc(ctor_num_params, sizeof(uint32_t), 0);
-        ctor_param_dot = ecalloc(ctor_num_params, sizeof(ctor_nest_info *));
-
-        /* Pass 1: match params to flat columns by name */
-        for (uint32_t p = 0; p < ctor_num_params; p++) {
-            ctor_param_col[p] = -1;
-            ctor_param_nest_offset[p] = 0;
-            zend_string *pname = arg_info[p].name;
-
-            for (int c = 0; c < ncols; c++) {
-                if (col_is_ctor_arg[c]) continue;
-                const char *col = PQfname(res, c);
-                size_t col_len = strlen(col);
-                if (ZSTR_LEN(pname) == col_len &&
-                    memcmp(ZSTR_VAL(pname), col, col_len) == 0) {
-                    ctor_param_col[p] = c;
-                    col_is_ctor_arg[c] = true;
-                    break;
-                }
-            }
-
-            /* Auto-nest: flat column matched to a non-DateTime user class param */
-            if (ctor_param_col[p] >= 0 &&
-                ZEND_TYPE_IS_SET(arg_info[p].type) &&
-                ZEND_TYPE_HAS_NAME(arg_info[p].type)) {
-                zend_class_entry *pce = zend_lookup_class(ZEND_TYPE_NAME(arg_info[p].type));
-                if (pce &&
-                    !instanceof_function(pce, php_date_get_interface_ce()) &&
-                    !(pce->ce_flags & ZEND_ACC_ENUM) &&
-                    is_fast_path_class(pce)) {
-                    zend_string *fn;
-                    zend_property_info *fp;
-                    if (get_first_property(pce, &fn, &fp)) {
-                        ctor_param_nest_ce[p] = pce;
-                        ctor_param_nest_offset[p] = fp->offset;
-                    }
-                }
-            }
-        }
-
-        /* Pass 2: for unmatched class-typed params, collect dot-columns (e.g. "nested.yep") */
-        for (uint32_t p = 0; p < ctor_num_params; p++) {
-            if (ctor_param_col[p] >= 0) continue;
-            if (!ZEND_TYPE_IS_SET(arg_info[p].type) || !ZEND_TYPE_HAS_NAME(arg_info[p].type)) continue;
-
-            zend_class_entry *pce = zend_lookup_class(ZEND_TYPE_NAME(arg_info[p].type));
-            if (!pce || instanceof_function(pce, php_date_get_interface_ce()) || (pce->ce_flags & ZEND_ACC_ENUM) || !is_fast_path_class(pce)) continue;
-
-            zend_string *pname = arg_info[p].name;
-            size_t pname_len = ZSTR_LEN(pname);
-            const char *pname_val = ZSTR_VAL(pname);
-
-            /* Count matching dot-columns */
-            uint32_t dot_count = 0;
-            for (int c = 0; c < ncols; c++) {
-                if (col_is_ctor_arg[c]) continue;
-                const char *col = PQfname(res, c);
-                size_t col_len = strlen(col);
-                if (col_len > pname_len + 1 && col[pname_len] == '.' &&
-                    memcmp(col, pname_val, pname_len) == 0) {
-                    dot_count++;
-                }
-            }
-            if (dot_count == 0) continue;
-
-            /* Build property mappings */
-            ctor_nest_prop *dot_props = safe_emalloc(dot_count, sizeof(ctor_nest_prop), 0);
-            uint32_t idx = 0;
-
-            for (int c = 0; c < ncols; c++) {
-                if (col_is_ctor_arg[c]) continue;
-                const char *col = PQfname(res, c);
-                size_t col_len = strlen(col);
-                if (col_len > pname_len + 1 && col[pname_len] == '.' &&
-                    memcmp(col, pname_val, pname_len) == 0) {
-
-                    const char *sub = col + pname_len + 1;
-                    size_t sub_len = col_len - pname_len - 1;
-                    zend_string *sn = zend_string_init(sub, sub_len, 0);
-                    zend_property_info *pi = resolve_property(pce, sn);
-                    zend_string_release(sn);
-
-                    if (pi) {
-                        dot_props[idx].col_idx = c;
-                        dot_props[idx].prop_offset = pi->offset;
-                        dot_props[idx].skip_type_check = can_skip_type_check(pi, col_oids[c], datetime_ce);
-                        dot_props[idx].accepts_null = !ZEND_TYPE_IS_SET(pi->type) ||
-                            (ZEND_TYPE_FULL_MASK(pi->type) & MAY_BE_NULL);
-                        col_is_ctor_arg[c] = true;
-                        idx++;
-                    }
-                }
-            }
-
-            if (idx > 0) {
-                ctor_param_dot[p] = emalloc(sizeof(ctor_nest_info));
-                ctor_param_dot[p]->ce = pce;
-                ctor_param_dot[p]->count = idx;
-                ctor_param_dot[p]->props = dot_props;
-            } else {
-                efree(dot_props);
-            }
-        }
-
-        /* Determine if we can use positional args (no gaps in matched params) */
-        ctor_use_positional = true;
-        for (uint32_t p = 0; p < ctor_num_params; p++) {
-            if (ctor_param_col[p] < 0 && !ctor_param_dot[p]) {
-                /* Unmatched param — check if all subsequent are also unmatched (trailing optionals OK) */
-                for (uint32_t q = p; q < ctor_num_params; q++) {
-                    if (ctor_param_col[q] >= 0 || ctor_param_dot[q]) {
-                        /* Gap: matched param after unmatched — can't use positional */
-                        ctor_use_positional = false;
-                        break;
-                    }
-                }
-                break; /* Either we set false, or all trailing are unmatched (fine) */
-            }
-        }
-
-        if (ctor_use_positional) {
-            /* Count how many consecutive matched params from start */
-            for (uint32_t p = 0; p < ctor_num_params; p++) {
-                if (ctor_param_col[p] >= 0 || ctor_param_dot[p]) {
-                    ctor_positional_count = p + 1;
-                } else {
-                    break;
-                }
-            }
-            ctor_args = safe_emalloc(ctor_positional_count, sizeof(zval), 0);
-        } else {
-            zend_hash_init(&ctor_named_ht, ctor_num_params, NULL, ZVAL_PTR_DTOR, 0);
-            ctor_ht_inited = true;
-        }
-    }
-
-    /* Check if ALL columns are consumed by ctor args (skip post-ctor property writes) */
-    if (col_is_ctor_arg) {
-        ctor_all_cols = true;
-        for (int c = 0; c < ncols; c++) {
-            if (!col_is_ctor_arg[c]) { ctor_all_cols = false; break; }
-        }
-    }
-
-    /* Pre-resolve ctor function pointer and param limit (loop-invariant) */
-    zend_function *ctor_fn = has_ctor ? ce->constructor : NULL;
-    uint32_t ctor_param_limit = ctor_use_positional ? ctor_positional_count : ctor_num_params;
-
-    /* Pre-build call info for positional ctor path (avoids per-row struct init) */
-    zval ctor_retval;
-    zend_fcall_info ctor_fci;
-    zend_fcall_info_cache ctor_fcc;
-    if (has_ctor && ctor_use_positional) {
-        ctor_fci.size = sizeof(ctor_fci);
-        ZVAL_UNDEF(&ctor_fci.function_name);
-        ctor_fci.retval = &ctor_retval;
-        ctor_fci.param_count = ctor_param_limit;
-        ctor_fci.params = ctor_args;
-        ctor_fci.named_params = NULL;
-        ctor_fci.object = NULL; /* set per-row */
-
-        ctor_fcc.function_handler = ctor_fn;
-        ctor_fcc.called_scope = ce;
-        ctor_fcc.closure = NULL;
-        ctor_fcc.object = NULL; /* set per-row */
-    }
-
-    /* Build return array */
-    array_init_size(return_value, nrows);
-
-    for (int r = 0; r < nrows; r++) {
-        zval row_obj;
-        if (object_init_ex(&row_obj, ce) != SUCCESS) {
-            zend_throw_exception(zend_ce_error,
-                "pg_fast_query(): failed to instantiate object", 0);
-            goto cleanup;
-        }
-
-        /* ---- Constructor invocation ---- */
-        if (has_ctor) {
-            if (ctor_num_params > 0) {
-
-                if (ctor_use_positional) {
-                    /* --- Positional args fast path --- */
-                    for (uint32_t p = 0; p < ctor_param_limit; p++) {
-                        if (ctor_param_col[p] >= 0) {
-                            int c = ctor_param_col[p];
-                            bool is_null = PQgetisnull(res, r, c);
-
-                            if (is_null) {
-                                ZVAL_NULL(&ctor_args[p]);
-                            } else {
-                                convert_pg_value(&ctor_args[p], PQgetvalue(res, r, c),
-                                                 PQgetlength(res, r, c), col_oids[c], datetime_ce);
-                            }
-
-                            if (ctor_param_nest_ce[p] && !is_null) {
-                                zval nested_obj;
-                                if (object_init_ex(&nested_obj, ctor_param_nest_ce[p]) == SUCCESS) {
-                                    zval *slot = OBJ_PROP(Z_OBJ(nested_obj), ctor_param_nest_offset[p]);
-                                    zval_ptr_dtor(slot);
-                                    ZVAL_COPY_VALUE(slot, &ctor_args[p]);
-                                    ZVAL_COPY_VALUE(&ctor_args[p], &nested_obj);
-                                }
-                            }
-                        } else if (ctor_param_dot[p]) {
-                            ctor_nest_info *ni = ctor_param_dot[p];
-                            if (object_init_ex(&ctor_args[p], ni->ce) != SUCCESS) {
-                                ZVAL_NULL(&ctor_args[p]);
-                                continue;
-                            }
-                            fill_ctor_nest_object(Z_OBJ(ctor_args[p]), ni, res, r, col_oids, datetime_ce);
-                        } else {
-                            ZVAL_UNDEF(&ctor_args[p]);
-                        }
-                    }
-
-                    ctor_fci.object = Z_OBJ(row_obj);
-                    ctor_fcc.object = Z_OBJ(row_obj);
-                    zend_call_function(&ctor_fci, &ctor_fcc);
-                    zval_ptr_dtor(&ctor_retval);
-
-                    for (uint32_t p = 0; p < ctor_param_limit; p++) {
-                        zval_ptr_dtor(&ctor_args[p]);
-                    }
-                } else {
-                    /* --- Named params fallback (gaps in param mapping) --- */
-                    zend_hash_clean(&ctor_named_ht);
-
-                    for (uint32_t p = 0; p < ctor_param_limit; p++) {
-                        if (ctor_param_col[p] >= 0) {
-                            int c = ctor_param_col[p];
-                            zval val;
-                            bool is_null = PQgetisnull(res, r, c);
-
-                            if (is_null) {
-                                ZVAL_NULL(&val);
-                            } else {
-                                convert_pg_value(&val, PQgetvalue(res, r, c),
-                                                 PQgetlength(res, r, c), col_oids[c], datetime_ce);
-                            }
-
-                            if (ctor_param_nest_ce[p] && !is_null) {
-                                zval nested_obj;
-                                if (object_init_ex(&nested_obj, ctor_param_nest_ce[p]) == SUCCESS) {
-                                    zval *slot = OBJ_PROP(Z_OBJ(nested_obj), ctor_param_nest_offset[p]);
-                                    zval_ptr_dtor(slot);
-                                    ZVAL_COPY_VALUE(slot, &val);
-                                    ZVAL_COPY_VALUE(&val, &nested_obj);
-                                }
-                            }
-
-                            zend_hash_add_new(&ctor_named_ht, ctor_fn->common.arg_info[p].name, &val);
-
-                        } else if (ctor_param_dot[p]) {
-                            ctor_nest_info *ni = ctor_param_dot[p];
-                            zval nested_obj;
-                            if (object_init_ex(&nested_obj, ni->ce) != SUCCESS) continue;
-                            fill_ctor_nest_object(Z_OBJ(nested_obj), ni, res, r, col_oids, datetime_ce);
-
-                            zend_hash_add_new(&ctor_named_ht, ctor_fn->common.arg_info[p].name, &nested_obj);
-                        }
-                    }
-
-                    zend_call_known_function(ctor_fn, Z_OBJ(row_obj), ce, NULL,
-                                             0, NULL, &ctor_named_ht);
-                }
-            } else {
-                /* Constructor with zero params (may still call parent::__construct) */
-                zend_call_known_function(ctor_fn, Z_OBJ(row_obj), ce, NULL,
-                                         0, NULL, NULL);
-            }
-
-            if (UNEXPECTED(EG(exception))) {
-                zval_ptr_dtor(&row_obj);
-                goto cleanup;
-            }
-        }
-
-        /* ---- Per-column property writes (skip if all consumed by ctor) ---- */
-        if (ctor_all_cols) goto row_done;
-        for (int c = 0; c < ncols; c++) {
-            if (col_is_ctor_arg && col_is_ctor_arg[c]) continue;
-
-            zval val;
-            bool is_null = PQgetisnull(res, r, c);
-
-            if (is_null) {
-                ZVAL_NULL(&val);
-            } else if (col_enum_ces[c] != NULL) {
-                if (!convert_pg_enum(&val, PQgetvalue(res, r, c),
-                                     PQgetlength(res, r, c), col_enum_ces[c])) {
-                    zval_ptr_dtor(&row_obj);
-                    goto cleanup;
-                }
-            } else {
-                convert_pg_value(&val, PQgetvalue(res, r, c),
-                                 PQgetlength(res, r, c), col_oids[c], col_datetime_ces[c]);
-            }
-
-            /* ---- Fast path: direct property slot writes with nested support ---- */
-            if (class_fast_path && mappings[c].valid) {
-                col_mapping *m = &mappings[c];
-
-                if (m->depth == 1) {
-                    if (Z_TYPE(val) == IS_NULL ? m->accepts_null : m->skip_type_check) {
-                        zval *slot = OBJ_PROP(Z_OBJ(row_obj), m->offsets[0]);
-                        zval_ptr_dtor(slot);
-                        ZVAL_COPY_VALUE(slot, &val);
-                        continue;
-                    }
-                    zend_update_property_ex(m->props[0]->ce, Z_OBJ(row_obj), m->names[0], &val);
-                    zval_ptr_dtor(&val);
-                    continue;
-                }
-
-                /* Nested (depth > 1): walk path creating intermediate objects */
-                zend_object *cur_obj = Z_OBJ(row_obj);
-                bool ok = true;
-
-                for (int i = 0; i < m->depth - 1; i++) {
-                    zval *slot = OBJ_PROP(cur_obj, m->offsets[i]);
-                    if (Z_TYPE_P(slot) != IS_OBJECT) {
-                        zend_class_entry *child_ce = m->ces[i + 1];
-                        zval_ptr_dtor(slot);
-                        if (object_init_ex(slot, child_ce) != SUCCESS) {
-                            ok = false;
-                            break;
-                        }
-                    }
-                    cur_obj = Z_OBJ_P(slot);
-                }
-
-                if (ok) {
-                    int leaf = m->depth - 1;
-                    if (Z_TYPE(val) == IS_NULL ? m->accepts_null : m->skip_type_check) {
-                        zval *leaf_slot = OBJ_PROP(cur_obj, m->offsets[leaf]);
-                        zval_ptr_dtor(leaf_slot);
-                        ZVAL_COPY_VALUE(leaf_slot, &val);
-                        continue;
-                    }
-                    zend_update_property_ex(m->props[leaf]->ce, cur_obj, m->names[leaf], &val);
-                    zval_ptr_dtor(&val);
-                    continue;
-                }
-                zval_ptr_dtor(&val);
-                continue;
-            }
-
-            /* ---- Slow path: full property write (hash lookup + type coercion) ---- */
-            if (col_names) {
-                zend_update_property_ex(ce, Z_OBJ(row_obj), col_names[c], &val);
-            }
-            zval_ptr_dtor(&val);
-        }
-
-row_done:
-        add_next_index_zval(return_value, &row_obj);
-    }
-
-    /* ---- Cleanup ---- */
-cleanup:
-    if (mappings) {
-        for (int c = 0; c < ncols; c++) free_col_mapping(&mappings[c]);
-        efree(mappings);
-    }
-    if (col_names) {
-        for (int c = 0; c < ncols; c++) zend_string_release(col_names[c]);
-        efree(col_names);
-    }
-    efree(col_datetime_ces);
-    efree(col_enum_ces);
-    efree(col_oids);
-
-    if (ctor_ht_inited) zend_hash_destroy(&ctor_named_ht);
-    if (ctor_args) efree(ctor_args);
-    if (ctor_param_col) efree(ctor_param_col);
-    if (col_is_ctor_arg) efree(col_is_ctor_arg);
-    if (ctor_param_nest_ce) efree(ctor_param_nest_ce);
-    if (ctor_param_nest_offset) efree(ctor_param_nest_offset);
-    if (ctor_param_dot) {
-        for (uint32_t p = 0; p < ctor_all_params; p++) {
-            if (ctor_param_dot[p]) {
-                efree(ctor_param_dot[p]->props);
-                efree(ctor_param_dot[p]);
-            }
-        }
-        efree(ctor_param_dot);
-    }
-
-    if (UNEXPECTED(EG(exception))) {
+    if (EG(exception) != NULL) {
         RETURN_THROWS();
     }
 }
-/* }}} */
 
-/* {{{ arginfo */
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_pg_fast_query, 0, 2, IS_ARRAY, 0)
     ZEND_ARG_OBJ_INFO(0, result, PgSql\\Result, 0)
     ZEND_ARG_TYPE_INFO(0, class, IS_STRING, 0)
 ZEND_END_ARG_INFO()
-/* }}} */
 
-/* {{{ function entries */
 static const zend_function_entry pgsql_mapper_functions[] = {
     PHP_FE(pg_fast_query, arginfo_pg_fast_query)
     PHP_FE_END
 };
-/* }}} */
 
-/* {{{ PHP_MINIT_FUNCTION */
+static const zend_module_dep pgsql_mapper_dependencies[] = {
+    ZEND_MOD_REQUIRED("pgsql")
+    ZEND_MOD_REQUIRED("date")
+    ZEND_MOD_END
+};
+
 PHP_MINIT_FUNCTION(pgsql_mapper)
 {
+    pgsql_result_class = zend_hash_str_find_ptr(CG(class_table), "pgsql\\result", sizeof("pgsql\\result") - 1);
+
     return SUCCESS;
 }
-/* }}} */
 
-/* {{{ PHP_MINFO_FUNCTION */
 PHP_MINFO_FUNCTION(pgsql_mapper)
 {
     php_info_print_table_start();
@@ -1153,22 +1526,21 @@ PHP_MINFO_FUNCTION(pgsql_mapper)
     php_info_print_table_row(2, "Version", PHP_PGSQL_MAPPER_VERSION);
     php_info_print_table_end();
 }
-/* }}} */
 
-/* {{{ pgsql_mapper_module_entry */
 zend_module_entry pgsql_mapper_module_entry = {
-    STANDARD_MODULE_HEADER,
+    STANDARD_MODULE_HEADER_EX,
+    NULL,
+    pgsql_mapper_dependencies,
     PHP_PGSQL_MAPPER_EXTNAME,
     pgsql_mapper_functions,
     PHP_MINIT(pgsql_mapper),
-    NULL, /* MSHUTDOWN */
-    NULL, /* RINIT */
-    NULL, /* RSHUTDOWN */
+    NULL,
+    NULL,
+    NULL,
     PHP_MINFO(pgsql_mapper),
     PHP_PGSQL_MAPPER_VERSION,
     STANDARD_MODULE_PROPERTIES
 };
-/* }}} */
 
 #ifdef COMPILE_DL_PGSQL_MAPPER
 ZEND_GET_MODULE(pgsql_mapper)

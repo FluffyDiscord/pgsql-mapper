@@ -12,14 +12,15 @@ A PHP C extension that hydrates PostgreSQL results directly into typed PHP objec
 ## Architecture
 * **Execution Paths:**
     * **Fast:** Direct slot writes for classes without `__set` or custom object handlers, any property visibility. A type mismatch falls back to `zend_update_property_ex()` with the declaring class as scope.
-    * **Promoted-only constructor:** Skipped (`can_skip_promoted_ctor()`) when every param is promoted, the body has no other code, and every param has a column; the fast path fills the slots.
-    * **Constructor:** Called through the VM with positional or named args.
+    * **Promoted-only constructor:** Skipped (`can_skip_promoted_constructor()`) when every param is promoted, declared by the constructor's class, has a column, and the body has no other code; the fast path fills the slots.
+    * **Constructor:** Called through the VM with positional or named args. Internal (C) constructors are called without args.
     * **Slow:** `zend_update_property_ex()` for classes with `__set` or `create_object`.
 * **Object Mapping:**
     * **Dot Notation:** Columns like `"address.city"` map to `$obj->address->city` (max depth: 8). Instances are reused if referenced multiple times.
     * **Auto-nesting:** If a column targets a user class, the extension auto-creates the object and sets the value on its **first declared property**.
 * **Type Conversion:** PostgreSQL OIDs map to `int`, `float` (incl. NaN/±INF), `bool`, `DateTimeImmutable` (timestamps), and `string` (fallback). On the fast path, backed enums and `DateTimeImmutable` subclasses are type-directed.
-* **Timestamps:** `init_pg_iso_timestamptz()` builds ISO-style `timestamptz` values directly (no strtotime). Other shapes (`timestamp` without zone, non-ISO `DateStyle`, `infinity`) go through `php_date_initialize()`.
+* **Per-call plan:** `build_query_plan()` resolves columns, constructor params and the constructor call once; `hydrate_row()` only reads cells and writes slots.
+* **Timestamps:** `parse_iso_timestamptz()` + `initialize_offset_time()` build ISO-style `timestamptz` values directly (no strtotime). Other shapes (`timestamp` without zone, non-ISO `DateStyle`, `infinity`) go through `php_date_initialize()`.
 * **Vendored Structs:** The internal structs in `php_pgsql_mapper.h` **must** match the PHP version being compiled against.
 
 ## Adding a New Type Mapping

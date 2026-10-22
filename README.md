@@ -12,8 +12,8 @@ PHP extension that maps PostgreSQL result rows straight into typed PHP objects. 
 
 - [Typed values](#type-mapping) — `int`, `float`, `bool`, `DateTimeImmutable` and backed enums, not strings
 - [Nested objects](#nested-objects) — `"address.city"` columns fill `$row->address->city`
-- [Constructors](#constructors) — promoted-only constructors are skipped: 97 ns/row vs 84 ns/row for a plain DTO
-- [Speed](#benchmark) — 84 ns/row vs 515 ns/row for the same mapping in PHP
+- [Constructors](#constructors) — promoted-only constructors are skipped: 90 ns/row vs 78 ns/row for a plain DTO
+- [Speed](#benchmark) — 78 ns/row vs 516 ns/row for the same mapping in PHP
 
 ## Install
 
@@ -90,7 +90,7 @@ public ?\Carbon\CarbonImmutable $createdAt; // CarbonImmutable, not DateTimeImmu
 
 **Unparsed values → `null`** (`TypeError` on a non-nullable property): `infinity`, `-infinity`, BC `timestamp` without zone, and any timestamp in a `DateStyle` other than ISO.
 
-> `timestamptz` in ISO `DateStyle` (the default) skips PHP's generic date parser: 62 ns vs 233 ns per value. `timestamp` without zone and other styles use the generic parser.
+> `timestamptz` in ISO `DateStyle` (the default) skips PHP's generic date parser: 58 ns vs 233 ns per value. `timestamp` without zone and other styles use the generic parser.
 
 ### Backed enums
 
@@ -132,8 +132,9 @@ readonly class Order
 }
 ```
 
-- Up to 8 levels.
+- Up to 8 levels. Deeper → column ignored.
 - Nested classes are created without calling their constructor.
+- Properties typed as an interface or abstract class aren't created; the column goes through normal assignment.
 
 **Single-value objects need no dot path.** A column named after a class-typed property fills that class's first declared property, any visibility:
 
@@ -158,14 +159,13 @@ readonly class User
 
 | Class | What happens | [Benchmark](#benchmark) |
 |---|---|---|
-| No constructor | Slots written directly | FlatDto 84 ns/row |
-| Only promoted params, every param has a column | Constructor skipped, slots written directly | AccountDto 97 ns/row |
-| Any other constructor | Called per row; columns matched to params by name, missing params use their defaults | AccountDtoTwo 356 ns/row |
+| No constructor | Slots written directly | FlatDto 78 ns/row |
+| Only promoted params, every param has a column | Constructor skipped, slots written directly | AccountDto 90 ns/row |
+| Any other constructor | Called per row; columns matched to params by name, missing params use their defaults | AccountDtoTwo 290 ns/row |
+| Internal (C) constructor, e.g. extending `Exception` | Called without args; columns written after it | — |
 | `__set` or a custom object handler | Every column goes through a normal property write | — |
 
 > Constructor args get raw values: enum and `DateTimeImmutable` subclass mapping don't apply. Columns the constructor doesn't take are written after it runs.
->
-> Dot columns for a constructor param's object (`"nested.x"`) are written only when the type already fits. `'42'` into `int` is dropped, not cast.
 
 Not covered:
 
@@ -175,14 +175,14 @@ Not covered:
 
 ## Benchmark
 
-`test_performance.php`, 5000 rows, best of 10 runs, PHP 8.5.12, opcache on. PHP baselines call `pg_fetch_assoc` per row inside the timed loop.
+`test_performance.php`, 5000 rows, best of 10 runs, PHP 8.5.12 CLI without opcache. PHP baselines call `pg_fetch_assoc` per row inside the timed loop.
 
 | Path | C (ns/row) | PHP (ns/row) | Speedup |
 |---|---:|---:|---:|
-| `pg_fetch_assoc` loop, no objects | — | 118 | — |
-| FlatDto, no constructor | 84 | 515 | **6.1x** |
-| AccountDto, promoted-only constructor | 97 | 580 | **6.0x** |
-| AccountDtoTwo, custom constructor + nested object | 356 | 1064 | **3.0x** |
+| `pg_fetch_assoc` loop, no objects | — | 120 | — |
+| FlatDto, no constructor | 78 | 516 | **6.6x** |
+| AccountDto, promoted-only constructor | 90 | 588 | **6.5x** |
+| AccountDtoTwo, custom constructor + nested object | 290 | 1030 | **3.6x** |
 
 Mapping into a plain DTO is faster than `pg_fetch_assoc` returning arrays.
 

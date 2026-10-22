@@ -90,11 +90,11 @@ A property that also accepts `string` (`string|array`, untyped) gets the raw str
 public ?\Carbon\CarbonImmutable $createdAt; // CarbonImmutable, not DateTimeImmutable
 ```
 
-- The subclass constructor isn't called, same as Carbon's own `modify()`.
+- The subclass constructor isn't called.
 - Subclass with its own required typed property and no default → that property stays uninitialized. Don't use one here.
 - Internal subclass with a different object layout → plain `DateTimeImmutable`.
 
-**`date` → midnight UTC**, whatever `date.timezone` says: `2025-01-02` → `2025-01-02T00:00:00+00:00`. 57 ns vs 360 ns for `new DateTimeImmutable()`.
+**`date` → midnight UTC**, whatever `date.timezone` says: `2025-01-02` → `2025-01-02T00:00:00+00:00`.
 
 **Unparsed values → `null`** (`TypeError` on a non-nullable property): `infinity`, `-infinity`, BC `timestamp` without zone, any `DateStyle` other than ISO.
 
@@ -131,19 +131,12 @@ readonly class Product
 }
 ```
 
-- `json`/`jsonb` → same result as `json_decode($value, true)`, including the 511-level depth limit (deeper → `null`). Decoded with yyjson.
-- JSON that isn't an object or array (`"text"`, `42`) → normal assignment, so `TypeError` on `array`.
-- Array elements convert like columns: `int4[]` → `int`, `float8[]` → `float`, `bool[]` → `bool`, `timestamptz[]` → `DateTimeImmutable`, everything else (`text[]`, `date[]`, enum arrays…) → `string`.
-- Multi-dimensional arrays → nested lists. Custom bounds (`[0:2]={…}`) → still a 0-based list.
-- A `text`/`varchar` column holding array text in PostgreSQL's output format (`'{a,b}'`, no spaces) is parsed too, as a list of strings. Anything else → normal assignment (`TypeError`).
-- Scalar columns into a union like `bool|array` keep their normal type.
-
-| Column | C (ns/row) | PHP (ns/row) | Speedup |
-|---|---:|---:|---:|
-| `jsonb`, ~80 B object | 135 | 502 (`json_decode`) | 3.7x |
-| `jsonb`, ~1 KB order with 10 items | 1760 | 5670 (`json_decode`) | 3.2x |
-| `int4[]`, 10 items | 85 | 342 (`explode` + `intval`) | 4.0x |
-| `text[]`, 5 quoted items | 98 | 971 (`str_getcsv`) | 9.9x |
+- `json`/`jsonb` → same as `json_decode($value, true)`. Deeper than 511 levels → `null`.
+- JSON scalar (`"text"`, `42`) → `TypeError`.
+- Elements convert like columns: `int4[]` → `int`, `float8[]` → `float`, `bool[]` → `bool`, `timestamptz[]` → `DateTimeImmutable`, anything else → `string`.
+- Multi-dimensional → nested lists. Custom bounds (`[0:2]={…}`) → 0-based list.
+- `text` column holding `'{a,b}'` → `['a', 'b']`.
+- Unions like `bool|array` keep scalar columns as they are.
 
 ## Nested objects
 
@@ -221,6 +214,14 @@ Not covered:
 | AccountDtoTwo, custom constructor + nested object | 286 | 1007 | **3.5x** |
 
 Mapping into a plain DTO is faster than `pg_fetch_assoc` returning plain arrays.
+
+| Column → property | C (ns/row) | PHP (ns/row) | Speedup |
+|---|---:|---:|---:|
+| `jsonb`, ~80 B → `array` | 135 | 502 (`json_decode`) | 3.7x |
+| `jsonb`, ~1 KB → `array` | 1760 | 5670 (`json_decode`) | 3.2x |
+| `int4[]`, 10 items → `array` | 85 | 342 (`explode` + `intval`) | 4.0x |
+| `text[]`, 5 quoted items → `array` | 98 | 971 (`str_getcsv`) | 9.9x |
+| `date` → `DateTimeImmutable` | 57 | 360 (`new DateTimeImmutable`) | 6.3x |
 
 ### Real project
 

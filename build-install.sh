@@ -49,6 +49,14 @@ if [ -z "$LIBPQ_H" ] || [ ! -f "$LIBPQ_H" ]; then
     MISSING=1
 fi
 
+# ── yyjson headers (JSON decoder) ─────────────────────────────────────────────
+if ! { command -v pkg-config &>/dev/null && pkg-config --exists yyjson 2>/dev/null; } \
+    && [ ! -f /usr/include/yyjson.h ] && [ ! -f /usr/local/include/yyjson.h ]; then
+    echo "ERROR: yyjson.h not found (yyjson development headers missing)."
+    if command -v apt-get &>/dev/null; then hint "libyyjson-dev"; else hint "yyjson-devel"; fi
+    MISSING=1
+fi
+
 # ── PHP pgsql extension must be available (runtime dep) ───────────────────────
 if ! php -r 'exit(extension_loaded("pgsql") ? 0 : 1);' 2>/dev/null; then
     echo "ERROR: PHP 'pgsql' extension not loaded (required at runtime)."

@@ -101,6 +101,15 @@ class PrivatePromotedChild extends PrivatePromotedParent {
     public int $id;
 }
 
+class TypedColumnsRow {
+    public array $doc;
+    public array $ids;
+    public ?array $labels;
+    public DateTimeImmutable $day;
+    public string $raw_doc;
+    public bool|array $flag;
+}
+
 readonly class AccountDto {
     public function __construct(
         public int $account_id,
@@ -548,6 +557,27 @@ assert($stamps[2]->created_at->format('Y-m-d') === '-0043-03-15');
 pg_query($conn, "SET TimeZone = 'UTC'");
 
 echo "timestamptz assertions passed.\n\n";
+
+/* ===== Test 11: jsonb, arrays and date into typed properties ===== */
+echo "=== Test 11: jsonb / arrays / date ===\n";
+
+$typed = pg_fast_query(pg_query($conn, "
+    SELECT
+        '{\"id\": 7, \"tags\": [\"a\", \"b\"], \"price\": 9.5}'::jsonb AS doc,
+        '{1,2,3}'::int4[] AS ids,
+        ARRAY['x y', NULL, 'q\"uote']::text[] AS labels,
+        '2025-01-02'::date AS day,
+        '{\"id\": 7}'::jsonb AS raw_doc,
+        false AS flag
+"), TypedColumnsRow::class);
+assert($typed[0]->doc === ['id' => 7, 'tags' => ['a', 'b'], 'price' => 9.5]);
+assert($typed[0]->ids === [1, 2, 3]);
+assert($typed[0]->labels === ['x y', null, 'q"uote']);
+assert($typed[0]->day->format('c') === '2025-01-02T00:00:00+00:00');
+assert($typed[0]->raw_doc === '{"id": 7}');
+assert($typed[0]->flag === false);
+
+echo "jsonb / arrays / date assertions passed.\n\n";
 
 echo "=== ALL TESTS PASSED ===\n";
 

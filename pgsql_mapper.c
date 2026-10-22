@@ -8,12 +8,22 @@
 #include "zend_exceptions.h"
 #include "zend_enum.h"
 
+#include <yyjson.h>
+
 #include "php_pgsql_mapper.h"
 
 #define MAX_NESTING_DEPTH 8
 #define NOT_MAPPED -1
 #define INVALID_DIGITS -1
 
+#define JSON_MAX_DEPTH 512
+#define PG_ARRAY_MAX_DIMENSIONS 6
+#define PG_ARRAY_NULL "NULL"
+#define PG_ARRAY_NULL_LENGTH (sizeof(PG_ARRAY_NULL) - 1)
+
+#define ISO_DATE_LENGTH 10
+#define ISO_DATE_FIELD_COUNT 3
+#define ISO_DATE_SEPARATOR_COUNT 2
 #define MIN_ISO_TIMESTAMPTZ_LENGTH 22
 #define ISO_FRACTION_POSITION 19
 #define ISO_SEPARATOR_COUNT 5
@@ -83,9 +93,18 @@ typedef struct {
     int utc_offset;
 } iso_timestamp;
 
+typedef enum {
+    CONVERSION_DEFAULT,
+    CONVERSION_ENUM,
+    CONVERSION_DATE,
+    CONVERSION_JSON,
+    CONVERSION_PG_ARRAY,
+} column_conversion;
+
 typedef struct {
     bool skip_type_check;
     bool accepts_null;
+    bool accepts_array;
 } slot_type_check;
 
 typedef struct {
@@ -94,11 +113,20 @@ typedef struct {
     zend_class_entry *owner_classes[MAX_NESTING_DEPTH];
     zend_property_info *properties[MAX_NESTING_DEPTH];
     uint32_t property_offsets[MAX_NESTING_DEPTH];
+    column_conversion conversion;
     zend_class_entry *datetime_class;
     zend_class_entry *enum_class;
+    Oid array_element_oid;
     slot_type_check type_check;
     bool valid;
 } column_mapping;
+
+typedef struct {
+    const char *cursor;
+    const char *end;
+    Oid element_oid;
+    zend_class_entry *datetime_class;
+} pg_array_reader;
 
 typedef struct {
     Oid oid;
@@ -225,17 +253,6 @@ static bool is_integer_oid(Oid oid)
     }
 }
 
-static bool is_timestamp_oid(Oid oid)
-{
-    switch (oid) {
-        case PG_OID_TIMESTAMP:
-        case PG_OID_TIMESTAMPTZ:
-            return true;
-        default:
-            return false;
-    }
-}
-
 static bool is_string_converted_oid(Oid oid)
 {
     switch (oid) {
@@ -354,22 +371,126 @@ static bool can_skip_type_check(zend_type type, Oid oid, zend_class_entry *datet
     }
 }
 
-static bool type_accepts_null(zend_type type)
+static bool type_accepts(zend_type type, uint32_t value_mask)
 {
     if (!ZEND_TYPE_IS_SET(type)) {
         return true;
     }
 
-    return (ZEND_TYPE_FULL_MASK(type) & MAY_BE_NULL) != 0;
+    return (ZEND_TYPE_FULL_MASK(type) & value_mask) != 0;
 }
 
 static slot_type_check build_slot_type_check(zend_type type, Oid oid, zend_class_entry *datetime_class)
 {
     slot_type_check type_check;
     type_check.skip_type_check = can_skip_type_check(type, oid, datetime_class);
-    type_check.accepts_null = type_accepts_null(type);
+    type_check.accepts_null = type_accepts(type, MAY_BE_NULL);
+    type_check.accepts_array = type_accepts(type, MAY_BE_ARRAY);
 
     return type_check;
+}
+
+static bool is_json_oid(Oid oid)
+{
+    switch (oid) {
+        case PG_OID_JSON:
+        case PG_OID_JSONB:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool is_datetime_oid(Oid oid)
+{
+    switch (oid) {
+        case PG_OID_DATE:
+        case PG_OID_TIMESTAMP:
+        case PG_OID_TIMESTAMPTZ:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static Oid get_array_element_oid(Oid array_oid)
+{
+    switch (array_oid) {
+        case PG_OID_BOOL_ARRAY:
+            return PG_OID_BOOL;
+        case PG_OID_INT2_ARRAY:
+            return PG_OID_INT2;
+        case PG_OID_INT4_ARRAY:
+            return PG_OID_INT4;
+        case PG_OID_INT8_ARRAY:
+            return PG_OID_INT8;
+        case PG_OID_FLOAT4_ARRAY:
+            return PG_OID_FLOAT4;
+        case PG_OID_FLOAT8_ARRAY:
+            return PG_OID_FLOAT8;
+        case PG_OID_TIMESTAMP_ARRAY:
+            return PG_OID_TIMESTAMP;
+        case PG_OID_TIMESTAMPTZ_ARRAY:
+            return PG_OID_TIMESTAMPTZ;
+        default:
+            return PG_OID_TEXT;
+    }
+}
+
+static bool can_hold_pg_array_text(Oid oid)
+{
+    if (oid == PG_OID_BOX_ARRAY) {
+        return false;
+    }
+
+    return is_string_converted_oid(oid);
+}
+
+static column_conversion resolve_conversion(zend_type type, Oid oid, const column_mapping *mapping)
+{
+    if (mapping->enum_class != NULL) {
+        return CONVERSION_ENUM;
+    }
+
+    bool keeps_raw_string = type_accepts(type, MAY_BE_STRING);
+    if (keeps_raw_string) {
+        return CONVERSION_DEFAULT;
+    }
+
+    if (oid == PG_OID_DATE) {
+        bool wants_date = accepts_instance_of(type, mapping->datetime_class);
+        if (wants_date) {
+            return CONVERSION_DATE;
+        }
+    }
+
+    bool wants_array = type_accepts(type, MAY_BE_ARRAY);
+    if (!wants_array) {
+        return CONVERSION_DEFAULT;
+    }
+
+    bool is_json = is_json_oid(oid);
+    if (is_json) {
+        return CONVERSION_JSON;
+    }
+
+    bool holds_array_text = can_hold_pg_array_text(oid);
+
+    return holds_array_text ? CONVERSION_PG_ARRAY : CONVERSION_DEFAULT;
+}
+
+static bool can_skip_conversion_type_check(column_conversion conversion, slot_type_check type_check)
+{
+    switch (conversion) {
+        case CONVERSION_ENUM:
+        case CONVERSION_DATE:
+            return true;
+        case CONVERSION_JSON:
+        case CONVERSION_PG_ARRAY:
+            return false;
+        default:
+            return type_check.skip_type_check;
+    }
 }
 
 static zend_always_inline bool is_digit(char character)
@@ -377,13 +498,14 @@ static zend_always_inline bool is_digit(char character)
     return character >= '0' && character <= '9';
 }
 
-static zend_always_inline zend_long parse_long(const char *digits)
+static zend_always_inline zend_long parse_long(const char *digits, size_t length)
 {
+    const char *end = digits + length;
     bool is_negative = digits[0] == '-';
     const char *cursor = is_negative ? digits + 1 : digits;
     zend_ulong magnitude = 0;
 
-    for (; *cursor != '\0'; cursor++) {
+    for (; cursor < end; cursor++) {
         magnitude = magnitude * 10 + (zend_ulong)(*cursor - '0');
     }
 
@@ -422,10 +544,11 @@ static zend_always_inline int parse_digits(const char *text, int width)
     return value;
 }
 
-static bool parse_iso_date_time(const char *raw, int fields[ISO_FIELD_COUNT])
+static zend_always_inline bool parse_iso_fields(const char *raw, int separator_count, int field_count,
+                                                int fields[ISO_FIELD_COUNT])
 {
 #pragma GCC unroll 8
-    for (int index = 0; index < ISO_SEPARATOR_COUNT; index++) {
+    for (int index = 0; index < separator_count; index++) {
         const iso_separator *expected = &ISO_DATE_TIME_SEPARATORS[index];
         if (raw[expected->position] != expected->separator) {
             return false;
@@ -433,7 +556,7 @@ static bool parse_iso_date_time(const char *raw, int fields[ISO_FIELD_COUNT])
     }
 
 #pragma GCC unroll 8
-    for (int index = 0; index < ISO_FIELD_COUNT; index++) {
+    for (int index = 0; index < field_count; index++) {
         const iso_field *field = &ISO_DATE_TIME_FIELDS[index];
         int value = parse_digits(raw + field->position, field->width);
         if (value == INVALID_DIGITS) {
@@ -551,7 +674,7 @@ static bool parse_iso_timestamptz(const char *raw, int length, iso_timestamp *ti
         return false;
     }
 
-    bool has_date_time = parse_iso_date_time(raw, timestamp->fields);
+    bool has_date_time = parse_iso_fields(raw, ISO_SEPARATOR_COUNT, ISO_FIELD_COUNT, timestamp->fields);
     if (!has_date_time) {
         return false;
     }
@@ -564,6 +687,21 @@ static bool parse_iso_timestamptz(const char *raw, int length, iso_timestamp *ti
     }
 
     return apply_era_suffix(cursor, end, &timestamp->fields[FIELD_YEAR]);
+}
+
+static bool parse_iso_date(const char *raw, int length, iso_timestamp *timestamp)
+{
+    if (length < ISO_DATE_LENGTH) {
+        return false;
+    }
+
+    memset(timestamp, 0, sizeof(*timestamp));
+    bool has_date = parse_iso_fields(raw, ISO_DATE_SEPARATOR_COUNT, ISO_DATE_FIELD_COUNT, timestamp->fields);
+    if (!has_date) {
+        return false;
+    }
+
+    return apply_era_suffix(raw + ISO_DATE_LENGTH, raw + length, &timestamp->fields[FIELD_YEAR]);
 }
 
 static zend_long count_days_since_epoch(zend_long year, zend_long month, zend_long day)
@@ -628,13 +766,172 @@ static void convert_pg_datetime(zval *value, const char *raw, int length, zend_c
     ZVAL_COPY_VALUE(value, &date_object);
 }
 
+static void convert_pg_date(zval *value, const char *raw, int length, zend_class_entry *datetime_class)
+{
+    iso_timestamp timestamp;
+    bool is_iso = parse_iso_date(raw, length, &timestamp);
+    if (!is_iso) {
+        ZVAL_NULL(value);
+
+        return;
+    }
+
+    php_date_instantiate(datetime_class, value);
+    initialize_offset_time(Z_PHPDATE_P(value), &timestamp);
+}
+
+static void *allocate_json_memory(void *context, size_t size)
+{
+    return emalloc(size);
+}
+
+static void *reallocate_json_memory(void *context, void *pointer, size_t old_size, size_t size)
+{
+    return erealloc(pointer, size);
+}
+
+static void free_json_memory(void *context, void *pointer)
+{
+    efree(pointer);
+}
+
+static const yyjson_alc JSON_ALLOCATOR = {
+    allocate_json_memory,
+    reallocate_json_memory,
+    free_json_memory,
+    NULL,
+};
+
+static bool build_json_value(zval *value, yyjson_val *node, int depth);
+
+static void build_json_number(zval *value, yyjson_val *node)
+{
+    yyjson_subtype subtype = yyjson_get_subtype(node);
+
+    switch (subtype) {
+        case YYJSON_SUBTYPE_UINT: {
+            uint64_t number = yyjson_get_uint(node);
+            if (number > ZEND_LONG_MAX) {
+                ZVAL_DOUBLE(value, (double)number);
+
+                return;
+            }
+            ZVAL_LONG(value, (zend_long)number);
+
+            return;
+        }
+        case YYJSON_SUBTYPE_SINT:
+            ZVAL_LONG(value, (zend_long)yyjson_get_sint(node));
+
+            return;
+        default:
+            ZVAL_DOUBLE(value, yyjson_get_real(node));
+    }
+}
+
+static bool build_json_array(zval *value, yyjson_val *node, int depth)
+{
+    uint32_t size = (uint32_t)yyjson_arr_size(node);
+    array_init_size(value, size);
+    zend_hash_real_init_packed(Z_ARRVAL_P(value));
+
+    yyjson_arr_iter iterator = yyjson_arr_iter_with(node);
+    for (uint32_t index = 0; index < size; index++) {
+        yyjson_val *item = yyjson_arr_iter_next(&iterator);
+        zval element;
+        bool built = build_json_value(&element, item, depth);
+        if (!built) {
+            zval_ptr_dtor(value);
+
+            return false;
+        }
+        zend_hash_next_index_insert_new(Z_ARRVAL_P(value), &element);
+    }
+
+    return true;
+}
+
+static bool build_json_object(zval *value, yyjson_val *node, int depth)
+{
+    uint32_t size = (uint32_t)yyjson_obj_size(node);
+    array_init_size(value, size);
+
+    yyjson_obj_iter iterator = yyjson_obj_iter_with(node);
+    for (uint32_t index = 0; index < size; index++) {
+        yyjson_val *key = yyjson_obj_iter_next(&iterator);
+        zval element;
+        bool built = build_json_value(&element, yyjson_obj_iter_get_val(key), depth);
+        if (!built) {
+            zval_ptr_dtor(value);
+
+            return false;
+        }
+        zend_symtable_str_update(Z_ARRVAL_P(value), yyjson_get_str(key), yyjson_get_len(key), &element);
+    }
+
+    return true;
+}
+
+static bool build_json_value(zval *value, yyjson_val *node, int depth)
+{
+    yyjson_type type = yyjson_get_type(node);
+
+    switch (type) {
+        case YYJSON_TYPE_NULL:
+            ZVAL_NULL(value);
+
+            return true;
+        case YYJSON_TYPE_BOOL:
+            ZVAL_BOOL(value, yyjson_get_bool(node));
+
+            return true;
+        case YYJSON_TYPE_NUM:
+            build_json_number(value, node);
+
+            return true;
+        case YYJSON_TYPE_STR:
+            ZVAL_STRINGL_FAST(value, yyjson_get_str(node), yyjson_get_len(node));
+
+            return true;
+        default:
+            break;
+    }
+
+    int nesting = depth + 1;
+    if (nesting >= JSON_MAX_DEPTH) {
+        return false;
+    }
+
+    if (type == YYJSON_TYPE_ARR) {
+        return build_json_array(value, node, nesting);
+    }
+
+    return build_json_object(value, node, nesting);
+}
+
+static void convert_pg_json(zval *value, const char *raw, int length)
+{
+    yyjson_doc *document = yyjson_read_opts((char *)raw, length, YYJSON_READ_ALLOW_INF_AND_NAN, &JSON_ALLOCATOR, NULL);
+    if (document == NULL) {
+        ZVAL_NULL(value);
+
+        return;
+    }
+
+    bool built = build_json_value(value, yyjson_doc_get_root(document), 0);
+    yyjson_doc_free(document);
+    if (!built) {
+        ZVAL_NULL(value);
+    }
+}
+
 static bool convert_pg_enum(zval *value, const char *raw, int length, zend_class_entry *enum_class)
 {
     zend_object *case_object = NULL;
     zend_result lookup_status;
 
     if (enum_class->enum_backing_type == IS_LONG) {
-        lookup_status = zend_enum_get_case_by_value(&case_object, enum_class, parse_long(raw), NULL, false);
+        lookup_status = zend_enum_get_case_by_value(&case_object, enum_class, parse_long(raw, length), NULL, false);
     } else {
         zend_string *key = zend_string_init(raw, length, 0);
         lookup_status = zend_enum_get_case_by_value(&case_object, enum_class, 0, key, false);
@@ -659,7 +956,7 @@ static zend_always_inline void convert_pg_value(zval *value, const char *raw, in
         case PG_OID_INT2:
         case PG_OID_INT4:
         case PG_OID_INT8:
-            ZVAL_LONG(value, parse_long(raw));
+            ZVAL_LONG(value, parse_long(raw, length));
             break;
 
         case PG_OID_FLOAT4:
@@ -697,16 +994,253 @@ static zend_always_inline void read_cell(zval *value, PGresult *result, int row,
     convert_pg_value(value, raw, length, oid, datetime_class);
 }
 
-static zend_always_inline bool read_mapped_cell(zval *value, PGresult *result, const column_plan *column_info,
-                                                int row, int column)
+static bool is_pg_array_boundary(char character)
 {
-    zend_class_entry *enum_class = column_info->mapping.enum_class;
-    if (enum_class == NULL) {
-        read_cell(value, result, row, column, column_info->oid, column_info->mapping.datetime_class);
+    switch (character) {
+        case ',':
+        case '}':
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool parse_pg_array(zval *value, pg_array_reader *reader, int depth);
+
+static bool parse_unquoted_element(zval *element, pg_array_reader *reader)
+{
+    const char *start = reader->cursor;
+
+    for (; reader->cursor < reader->end; reader->cursor++) {
+        bool at_boundary = is_pg_array_boundary(*reader->cursor);
+        if (at_boundary) {
+            break;
+        }
+    }
+
+    size_t length = reader->cursor - start;
+    if (length == 0) {
+        return false;
+    }
+
+    if (length == PG_ARRAY_NULL_LENGTH) {
+        int compared = memcmp(start, PG_ARRAY_NULL, PG_ARRAY_NULL_LENGTH);
+        if (compared == 0) {
+            ZVAL_NULL(element);
+
+            return true;
+        }
+    }
+
+    convert_pg_value(element, start, length, reader->element_oid, reader->datetime_class);
+
+    return true;
+}
+
+static const char *find_closing_quote(const char *cursor, const char *end, bool *has_escapes)
+{
+    *has_escapes = false;
+
+    for (; cursor < end; cursor++) {
+        if (*cursor == '"') {
+            return cursor;
+        }
+        if (*cursor == '\\') {
+            *has_escapes = true;
+            cursor++;
+        }
+    }
+
+    return NULL;
+}
+
+static zend_string *unescape_quoted_element(const char *start, const char *closing)
+{
+    zend_string *text = zend_string_alloc(closing - start, 0);
+    char *output = ZSTR_VAL(text);
+
+    for (const char *cursor = start; cursor < closing; cursor++) {
+        if (*cursor == '\\') {
+            cursor++;
+        }
+        *output = *cursor;
+        output++;
+    }
+
+    *output = '\0';
+    ZSTR_LEN(text) = output - ZSTR_VAL(text);
+
+    return text;
+}
+
+static bool parse_quoted_element(zval *element, pg_array_reader *reader)
+{
+    const char *start = reader->cursor + 1;
+    bool has_escapes;
+    const char *closing = find_closing_quote(start, reader->end, &has_escapes);
+    if (closing == NULL) {
+        return false;
+    }
+
+    reader->cursor = closing + 1;
+    if (!has_escapes) {
+        convert_pg_value(element, start, closing - start, reader->element_oid, reader->datetime_class);
 
         return true;
     }
 
+    zend_string *text = unescape_quoted_element(start, closing);
+    convert_pg_value(element, ZSTR_VAL(text), ZSTR_LEN(text), reader->element_oid, reader->datetime_class);
+    zend_string_release(text);
+
+    return true;
+}
+
+static bool parse_pg_array_element(zval *element, pg_array_reader *reader, int depth)
+{
+    if (reader->cursor == reader->end) {
+        return false;
+    }
+
+    switch (*reader->cursor) {
+        case '{':
+            return parse_pg_array(element, reader, depth + 1);
+        case '"':
+            return parse_quoted_element(element, reader);
+        default:
+            return parse_unquoted_element(element, reader);
+    }
+}
+
+static bool parse_pg_array_items(zval *value, pg_array_reader *reader, int depth)
+{
+    while (reader->cursor < reader->end) {
+        zval element;
+        bool parsed = parse_pg_array_element(&element, reader, depth);
+        if (!parsed) {
+            return false;
+        }
+        zend_hash_next_index_insert_new(Z_ARRVAL_P(value), &element);
+
+        if (reader->cursor == reader->end) {
+            return false;
+        }
+
+        char separator = *reader->cursor;
+        reader->cursor++;
+        if (separator == '}') {
+            return true;
+        }
+        if (separator != ',') {
+            return false;
+        }
+    }
+
+    return false;
+}
+
+static bool parse_pg_array(zval *value, pg_array_reader *reader, int depth)
+{
+    if (depth > PG_ARRAY_MAX_DIMENSIONS) {
+        return false;
+    }
+
+    reader->cursor++;
+    array_init(value);
+
+    if (reader->cursor == reader->end) {
+        zval_ptr_dtor(value);
+
+        return false;
+    }
+
+    if (*reader->cursor == '}') {
+        reader->cursor++;
+
+        return true;
+    }
+
+    bool parsed = parse_pg_array_items(value, reader, depth);
+    if (!parsed) {
+        zval_ptr_dtor(value);
+    }
+
+    return parsed;
+}
+
+static void skip_dimension_prefix(pg_array_reader *reader)
+{
+    if (*reader->cursor != '[') {
+        return;
+    }
+
+    const char *equals = memchr(reader->cursor, '=', reader->end - reader->cursor);
+    if (equals != NULL) {
+        reader->cursor = equals + 1;
+    }
+}
+
+static bool parse_whole_pg_array(zval *value, pg_array_reader *reader)
+{
+    skip_dimension_prefix(reader);
+    if (*reader->cursor != '{') {
+        return false;
+    }
+
+    bool parsed = parse_pg_array(value, reader, 1);
+    if (!parsed) {
+        return false;
+    }
+
+    if (reader->cursor != reader->end) {
+        zval_ptr_dtor(value);
+
+        return false;
+    }
+
+    return true;
+}
+
+static void convert_pg_array(zval *value, const char *raw, int length, Oid element_oid,
+                             zend_class_entry *datetime_class)
+{
+    pg_array_reader reader = {raw, raw + length, element_oid, datetime_class};
+    bool parsed = parse_whole_pg_array(value, &reader);
+    if (!parsed) {
+        ZVAL_STRINGL(value, raw, length);
+    }
+}
+
+static zend_always_inline bool convert_mapped_value(zval *value, const char *raw, int length,
+                                                    const column_plan *column_info)
+{
+    const column_mapping *mapping = &column_info->mapping;
+
+    switch (mapping->conversion) {
+        case CONVERSION_ENUM:
+            return convert_pg_enum(value, raw, length, mapping->enum_class);
+        case CONVERSION_DATE:
+            convert_pg_date(value, raw, length, mapping->datetime_class);
+
+            return true;
+        case CONVERSION_JSON:
+            convert_pg_json(value, raw, length);
+
+            return true;
+        case CONVERSION_PG_ARRAY:
+            convert_pg_array(value, raw, length, mapping->array_element_oid, mapping->datetime_class);
+
+            return true;
+        default:
+            convert_pg_value(value, raw, length, column_info->oid, mapping->datetime_class);
+
+            return true;
+    }
+}
+
+static zend_always_inline bool read_mapped_cell(zval *value, PGresult *result, const column_plan *column_info,
+                                                int row, int column)
+{
     bool is_null = PQgetisnull(result, row, column);
     if (is_null) {
         ZVAL_NULL(value);
@@ -717,15 +1251,26 @@ static zend_always_inline bool read_mapped_cell(zval *value, PGresult *result, c
     const char *raw = PQgetvalue(result, row, column);
     int length = PQgetlength(result, row, column);
 
-    return convert_pg_enum(value, raw, length, enum_class);
+    return convert_mapped_value(value, raw, length, column_info);
+}
+
+static zend_always_inline bool can_write_directly(const zval *value, slot_type_check type_check)
+{
+    switch (Z_TYPE_P(value)) {
+        case IS_NULL:
+            return type_check.accepts_null;
+        case IS_ARRAY:
+            return type_check.accepts_array;
+        default:
+            return type_check.skip_type_check;
+    }
 }
 
 static zend_always_inline void write_property_value(zend_object *object, uint32_t offset, zend_property_info *property,
                                                     zend_string *name, zval *value, slot_type_check type_check)
 {
-    bool is_null_value = Z_TYPE_P(value) == IS_NULL;
-    bool can_write_directly = is_null_value ? type_check.accepts_null : type_check.skip_type_check;
-    if (can_write_directly) {
+    bool writes_directly = can_write_directly(value, type_check);
+    if (writes_directly) {
         zval *slot = OBJ_PROP(object, offset);
         i_zval_ptr_dtor(slot);
         ZVAL_COPY_VALUE(slot, value);
@@ -835,16 +1380,16 @@ static void resolve_leaf_conversion(column_mapping *mapping, Oid oid)
 {
     zend_property_info *leaf = mapping->properties[mapping->depth - 1];
 
-    bool is_timestamp = is_timestamp_oid(oid);
-    if (is_timestamp) {
+    bool is_datetime = is_datetime_oid(oid);
+    if (is_datetime) {
         mapping->datetime_class = resolve_datetime_class(leaf->type, mapping->datetime_class);
     }
 
     mapping->enum_class = resolve_enum_class(leaf->type, oid);
+    mapping->conversion = resolve_conversion(leaf->type, oid, mapping);
+    mapping->array_element_oid = get_array_element_oid(oid);
     mapping->type_check = build_slot_type_check(leaf->type, oid, mapping->datetime_class);
-    if (mapping->enum_class != NULL) {
-        mapping->type_check.skip_type_check = true;
-    }
+    mapping->type_check.skip_type_check = can_skip_conversion_type_check(mapping->conversion, mapping->type_check);
 }
 
 static void build_column_mapping(column_mapping *mapping, const char *column_name, zend_class_entry *root_class, Oid oid)

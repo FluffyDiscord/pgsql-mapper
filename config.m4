@@ -56,6 +56,33 @@ if test "$PHP_PGSQL_MAPPER" != "no"; then
     $LIBPQ_LIBS
   ])
 
+  AC_MSG_CHECKING([for yyjson via pkg-config])
+  if test -x "$PKG_CONFIG" && $PKG_CONFIG --exists yyjson 2>/dev/null; then
+    YYJSON_CFLAGS=$($PKG_CONFIG --cflags yyjson)
+    YYJSON_LIBS=$($PKG_CONFIG --libs yyjson)
+    AC_MSG_RESULT([found])
+  else
+    AC_MSG_RESULT([not found, using defaults])
+    YYJSON_CFLAGS=""
+    YYJSON_LIBS="-lyyjson"
+  fi
+
+  PHP_EVAL_INCLINE($YYJSON_CFLAGS)
+  PHP_EVAL_LIBLINE($YYJSON_LIBS, PGSQL_MAPPER_SHARED_LIBADD)
+
+  SAVED_CPPFLAGS="$CPPFLAGS"
+  CPPFLAGS="$CPPFLAGS $YYJSON_CFLAGS $INCLUDES"
+  AC_CHECK_HEADER([yyjson.h], [], [
+    AC_MSG_ERROR([yyjson.h not found. Install yyjson-devel (openSUSE/Fedora) or libyyjson-dev (Debian/Ubuntu).])
+  ])
+  CPPFLAGS="$SAVED_CPPFLAGS"
+
+  PHP_CHECK_LIBRARY(yyjson, yyjson_read_opts, [], [
+    AC_MSG_ERROR([libyyjson not found. Install yyjson-devel (openSUSE/Fedora) or libyyjson-dev (Debian/Ubuntu).])
+  ], [
+    $YYJSON_LIBS
+  ])
+
   PHP_ADD_EXTENSION_DEP(pgsql_mapper, pgsql)
   PHP_ADD_EXTENSION_DEP(pgsql_mapper, date)
 

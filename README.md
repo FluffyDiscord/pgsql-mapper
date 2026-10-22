@@ -2,18 +2,13 @@
 
 PHP extension that maps PostgreSQL result rows straight into typed PHP objects. PHP 8.5+, `ext/pgsql` results.
 
-> [!WARNING]
-> **This extension was written by AI (Claude) and is NOT production-ready.**
-> Use at your own risk. The author takes no liability for any damages, data loss,
-> crashes, or other issues arising from its use. No guarantees are made regarding
-> correctness, stability, or security.
-
 **Features**
 
 - [Typed values](#type-mapping) — `int`, `float`, `bool`, `DateTimeImmutable` and backed enums, not strings
+- [JSON and arrays](#json-and-arrays) — `jsonb` and `int4[]`/`text[]`… straight into PHP arrays, 3.2–9.9x faster than decoding in PHP
 - [Nested objects](#nested-objects) — `"address.city"` columns fill `$row->address->city`
-- [Constructors](#constructors) — promoted-only constructors are skipped: 90 ns/row vs 78 ns/row for a plain DTO
-- [Speed](#benchmark) — 78 ns/row vs 516 ns/row for the same mapping in PHP
+- [Constructors](#constructors) — promoted-only constructors cost 90 ns/row vs 77 ns/row for a plain DTO
+- [Speed](#benchmark) — 77 ns/row vs 510 ns/row for the same mapping in PHP
 
 ## Install
 
@@ -21,7 +16,7 @@ PHP extension that maps PostgreSQL result rows straight into typed PHP objects. 
 bash build-install.sh
 ```
 
-Needs `gcc`, `make`, PHP dev headers, libpq headers and `ext/pgsql`. The script names any missing package for your distro.
+Needs `gcc`, `make`, PHP dev headers, libpq and [yyjson](https://github.com/ibireme/yyjson) headers, and `ext/pgsql`. The script names any missing package for your distro (`yyjson-devel` / `libyyjson-dev`).
 
 IDE stubs:
 
@@ -51,7 +46,7 @@ composer require --dev fluffydiscord/fast-pgsql-mapper-stubs
    $rows = pg_fast_query($result, AccountRow::class);
    ```
 
-**Columns match properties by name.** Public, protected and private all work. Same speed for each.
+**Columns match properties by name.** Public, protected and private all work, at the same speed.
 
 ## Type mapping
 
@@ -62,9 +57,20 @@ composer require --dev fluffydiscord/fast-pgsql-mapper-stubs
 | `bool` | `bool` |
 | `timestamp`, `timestamptz` | `DateTimeImmutable` |
 | `NULL` | `null` |
-| anything else (`numeric`, `text`, `date`, `json`, `uuid`, arrays…) | `string` |
+| anything else (`numeric`, `text`, `uuid`…) | `string` |
 
-**Value doesn't fit the property → normal PHP property assignment (coercive mode):**
+**Some types depend on the property type.** Otherwise they stay `string`:
+
+| PostgreSQL | Property type | PHP |
+|---|---|---|
+| `date` | `DateTimeImmutable` (or subclass, `DateTimeInterface`) | midnight UTC |
+| `json`, `jsonb` | `array` | [decoded array](#json-and-arrays) |
+| any array (`int4[]`, `text[]`…) | `array` | [PHP list](#json-and-arrays) |
+| text column | backed enum | [enum case](#backed-enums) |
+
+A property that also accepts `string` (`string|array`, untyped) gets the raw string.
+
+**Value doesn't fit the property → normal PHP assignment (coercive mode):**
 
 | Case | Result |
 |---|---|
@@ -84,13 +90,15 @@ composer require --dev fluffydiscord/fast-pgsql-mapper-stubs
 public ?\Carbon\CarbonImmutable $createdAt; // CarbonImmutable, not DateTimeImmutable
 ```
 
-- The subclass constructor isn't called, same as Carbon's own `modify()` etc.
+- The subclass constructor isn't called, same as Carbon's own `modify()`.
 - Subclass with its own required typed property and no default → that property stays uninitialized. Don't use one here.
 - Internal subclass with a different object layout → plain `DateTimeImmutable`.
 
-**Unparsed values → `null`** (`TypeError` on a non-nullable property): `infinity`, `-infinity`, BC `timestamp` without zone, and any timestamp in a `DateStyle` other than ISO.
+**`date` → midnight UTC**, whatever `date.timezone` says: `2025-01-02` → `2025-01-02T00:00:00+00:00`. 57 ns vs 360 ns for `new DateTimeImmutable()`.
 
-> `timestamptz` in ISO `DateStyle` (the default) skips PHP's generic date parser: 58 ns vs 233 ns per value. `timestamp` without zone and other styles use the generic parser.
+**Unparsed values → `null`** (`TypeError` on a non-nullable property): `infinity`, `-infinity`, BC `timestamp` without zone, any `DateStyle` other than ISO.
+
+> `timestamptz` in ISO `DateStyle` (the default) skips PHP's generic date parser: 47 ns vs 222 ns per value.
 
 ### Backed enums
 
@@ -109,6 +117,33 @@ readonly class Row
 - String-backed ← text columns. Int-backed ← integer columns. Other pairs → raw value.
 - Unknown value → `ValueError`, same as `Status::from()`.
 - Pure (non-backed) enums aren't mapped.
+
+## JSON and arrays
+
+**Type the property as `array`:**
+
+```php
+readonly class Product
+{
+    public array $attributes;  // jsonb '{"color": "red", "sizes": [1, 2]}' → ['color' => 'red', 'sizes' => [1, 2]]
+    public array $tagIds;      // int4[] '{1,2,NULL}' → [1, 2, null]
+    public ?array $labels;     // text[] '{"a b",c}' → ['a b', 'c']
+}
+```
+
+- `json`/`jsonb` → same result as `json_decode($value, true)`, including the 511-level depth limit (deeper → `null`). Decoded with yyjson.
+- JSON that isn't an object or array (`"text"`, `42`) → normal assignment, so `TypeError` on `array`.
+- Array elements convert like columns: `int4[]` → `int`, `float8[]` → `float`, `bool[]` → `bool`, `timestamptz[]` → `DateTimeImmutable`, everything else (`text[]`, `date[]`, enum arrays…) → `string`.
+- Multi-dimensional arrays → nested lists. Custom bounds (`[0:2]={…}`) → still a 0-based list.
+- A `text`/`varchar` column holding array text in PostgreSQL's output format (`'{a,b}'`, no spaces) is parsed too, as a list of strings. Anything else → normal assignment (`TypeError`).
+- Scalar columns into a union like `bool|array` keep their normal type.
+
+| Column | C (ns/row) | PHP (ns/row) | Speedup |
+|---|---:|---:|---:|
+| `jsonb`, ~80 B object | 135 | 502 (`json_decode`) | 3.7x |
+| `jsonb`, ~1 KB order with 10 items | 1760 | 5670 (`json_decode`) | 3.2x |
+| `int4[]`, 10 items | 85 | 342 (`explode` + `intval`) | 4.0x |
+| `text[]`, 5 quoted items | 98 | 971 (`str_getcsv`) | 9.9x |
 
 ## Nested objects
 
@@ -133,10 +168,10 @@ readonly class Order
 ```
 
 - Up to 8 levels. Deeper → column ignored.
-- Nested classes are created without calling their constructor.
-- Properties typed as an interface or abstract class aren't created; the column goes through normal assignment.
+- Nested objects are created without calling their constructor.
+- Interface or abstract-class properties aren't created; the column goes through normal assignment.
 
-**Single-value objects need no dot path.** A column named after a class-typed property fills that class's first declared property, any visibility:
+**Single-value objects need no dot path.** A column named after a class-typed property fills that class's first declared property:
 
 ```php
 readonly class Email
@@ -159,18 +194,19 @@ readonly class User
 
 | Class | What happens | [Benchmark](#benchmark) |
 |---|---|---|
-| No constructor | Slots written directly | FlatDto 78 ns/row |
+| No constructor | Slots written directly | FlatDto 77 ns/row |
 | Only promoted params, every param has a column | Constructor skipped, slots written directly | AccountDto 90 ns/row |
-| Any other constructor | Called per row; columns matched to params by name, missing params use their defaults | AccountDtoTwo 290 ns/row |
+| Any other constructor | Called per row; columns matched to params by name, missing params use their defaults | AccountDtoTwo 286 ns/row |
 | Internal (C) constructor, e.g. extending `Exception` | Called without args; columns written after it | — |
 | `__set` or a custom object handler | Every column goes through a normal property write | — |
 
-> Constructor args get raw values: enum and `DateTimeImmutable` subclass mapping don't apply. Columns the constructor doesn't take are written after it runs.
+> Constructor args get raw values: enum, `date`, JSON, array and `DateTimeImmutable` subclass mapping don't apply. Columns the constructor doesn't take are written after it runs.
 
 Not covered:
 
 - Nesting, enum or subclass mapping through union or intersection types
-- Hooked properties
+- JSON objects as `stdClass` (always arrays)
+- `box[]` (uses `;` between elements) → raw string
 - Nesting below a class with `__set` or a custom object handler
 
 ## Benchmark
@@ -179,12 +215,12 @@ Not covered:
 
 | Path | C (ns/row) | PHP (ns/row) | Speedup |
 |---|---:|---:|---:|
-| `pg_fetch_assoc` loop, no objects | — | 120 | — |
-| FlatDto, no constructor | 78 | 516 | **6.6x** |
-| AccountDto, promoted-only constructor | 90 | 588 | **6.5x** |
-| AccountDtoTwo, custom constructor + nested object | 290 | 1030 | **3.6x** |
+| `pg_fetch_assoc` loop, no objects | — | 117 | — |
+| FlatDto, no constructor | 77 | 510 | **6.6x** |
+| AccountDto, promoted-only constructor | 90 | 583 | **6.5x** |
+| AccountDtoTwo, custom constructor + nested object | 286 | 1007 | **3.5x** |
 
-Mapping into a plain DTO is faster than `pg_fetch_assoc` returning arrays.
+Mapping into a plain DTO is faster than `pg_fetch_assoc` returning plain arrays.
 
 ### Real project
 

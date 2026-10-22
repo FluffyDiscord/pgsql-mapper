@@ -269,6 +269,11 @@ $typed_cases = [
         ListDto::class,
         fn (array $row) => str_getcsv(trim($row['values'], '{}'), ',', '"', '\\'),
     ],
+    'timestamptz -> DateTimeImmutable' => [
+        "SELECT '2025-06-15 10:30:00+00'::timestamptz + g * interval '1 s' AS day FROM generate_series(1, $N) g",
+        DateDto::class,
+        fn (array $row) => new \DateTimeImmutable($row['day']),
+    ],
     'date -> DateTimeImmutable' => [
         "SELECT '2025-01-02'::date + g AS day FROM generate_series(1, $N) g",
         DateDto::class,
@@ -303,7 +308,7 @@ foreach ($typed_cases as $label => [$sql, $class, $php_mapping]) {
     }
     $ns_php_typed = $best / $N;
 
-    echo sprintf("%-26s C %8.1f ns/row   PHP %8.1f ns/row   speedup: %.2fx\n",
+    echo sprintf("%-33s C %8.1f ns/row   PHP %8.1f ns/row   speedup: %.2fx\n",
         $label, $ns_c_typed, $ns_php_typed, $ns_php_typed / $ns_c_typed);
 }
 

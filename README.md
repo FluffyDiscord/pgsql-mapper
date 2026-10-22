@@ -5,10 +5,10 @@ PHP extension that maps PostgreSQL result rows straight into typed PHP objects. 
 **Features**
 
 - [Typed values](#type-mapping) — `int`, `float`, `bool`, `DateTimeImmutable` and backed enums, not strings
-- [JSON and arrays](#json-and-arrays) — `jsonb` and `int4[]`/`text[]`… straight into PHP arrays, 3.9–12.9x faster than decoding in PHP
+- [JSON and arrays](#json-and-arrays) — `jsonb` and `int4[]`/`text[]`… straight into PHP arrays, 3.7–13.1x faster than decoding in PHP
 - [Nested objects](#nested-objects) — `"address.city"` columns fill `$row->address->city`
-- [Constructors](#constructors) — promoted-only constructors cost 92 ns/row vs 82 ns/row for a plain DTO
-- [Speed](#benchmark) — 82 ns/row vs 520 ns/row for the same mapping in PHP
+- [Constructors](#constructors) — promoted-only constructors cost 91 ns/row vs 82 ns/row for a plain DTO
+- [Speed](#benchmark) — 82 ns/row vs 517 ns/row for the same mapping in PHP
 
 ## Install
 
@@ -98,7 +98,7 @@ public ?\Carbon\CarbonImmutable $createdAt; // CarbonImmutable, not DateTimeImmu
 
 **Unparsed values → `null`** (`TypeError` on a non-nullable property): `infinity`, `-infinity`, BC `timestamp` without zone, any `DateStyle` other than ISO.
 
-> `timestamptz` in ISO `DateStyle` (the default) skips PHP's generic date parser: 47 ns vs 222 ns per value.
+> `timestamptz` in ISO `DateStyle` (the default) skips PHP's generic date parser: 6.8x faster than `new DateTimeImmutable()` ([benchmark](#benchmark)).
 
 ### Backed enums
 
@@ -188,8 +188,8 @@ readonly class User
 | Class | What happens | [Benchmark](#benchmark) |
 |---|---|---|
 | No constructor | Slots written directly | FlatDto 82 ns/row |
-| Only promoted params, every param has a column | Constructor skipped, slots written directly | AccountDto 92 ns/row |
-| Any other constructor | Called per row; columns matched to params by name, missing params use their defaults | AccountDtoTwo 281 ns/row |
+| Only promoted params, every param has a column | Constructor skipped, slots written directly | AccountDto 91 ns/row |
+| Any other constructor | Called per row; columns matched to params by name, missing params use their defaults | AccountDtoTwo 279 ns/row |
 | Internal (C) constructor, e.g. extending `Exception` | Called without args; columns written after it | — |
 | `__set` or a custom object handler | Every column goes through a normal property write | — |
 
@@ -208,19 +208,20 @@ Not covered:
 
 | DTO | C (ns/row) | PHP (ns/row) | Speedup |
 |---|---:|---:|---:|
-| `pg_fetch_assoc` loop, no objects | — | 121 | — |
-| FlatDto, no constructor | 82 | 520 | **6.3x** |
-| AccountDto, promoted-only constructor | 92 | 589 | **6.4x** |
-| AccountDtoTwo, custom constructor + nested object | 281 | 1018 | **3.6x** |
+| `pg_fetch_assoc` loop, no objects | — | 118 | — |
+| FlatDto, no constructor | 82 | 517 | **6.3x** |
+| AccountDto, promoted-only constructor | 91 | 580 | **6.4x** |
+| AccountDtoTwo, custom constructor + nested object | 279 | 1019 | **3.7x** |
 
 Mapping into a plain DTO is faster than `pg_fetch_assoc` returning plain arrays.
 
 | Column → property | C (ns/row) | PHP baseline | PHP (ns/row) | Speedup |
 |---|---:|---|---:|---:|
-| `jsonb` ~80 B → `array` | 115 | `json_decode` | 472 | **4.1x** |
-| `jsonb` ~1 KB → `array` | 1322 | `json_decode` | 5106 | **3.9x** |
-| `int4[]`, 10 items → `array` | 68 | `explode` + `intval` | 337 | **4.9x** |
-| `text[]`, 5 quoted items → `array` | 75 | `str_getcsv` | 966 | **12.9x** |
+| `jsonb` ~80 B → `array` | 115 | `json_decode` | 474 | **4.1x** |
+| `jsonb` ~1 KB → `array` | 1363 | `json_decode` | 5066 | **3.7x** |
+| `int4[]`, 10 items → `array` | 68 | `explode` + `intval` | 329 | **4.9x** |
+| `text[]`, 5 quoted items → `array` | 75 | `str_getcsv` | 976 | **13.1x** |
+| `timestamptz` → `DateTimeImmutable` | 48 | `new DateTimeImmutable` | 331 | **6.8x** |
 | `date` → `DateTimeImmutable` | 45 | `new DateTimeImmutable` | 353 | **7.8x** |
 
 ### Real project
